@@ -103,38 +103,26 @@ app.use(helmet({
       frameSrc: ["'none'"],
     },
   },
-  crossOriginEmbedderPolicy: false, // Allow embedding for blog content
-  crossOriginResourcePolicy: { policy: "cross-origin" }, // Allow cross-origin resources
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" },
 }));
 
 // Enhanced compression middleware
 app.use(compression({
-  level: 6, // Compression level (1-9, 6 is a good balance)
-  threshold: 1024, // Only compress responses larger than 1KB
+  level: 6,
+  threshold: 1024,
   filter: (req, res) => {
-    // Don't compress if client doesn't support it
     if (req.headers['x-no-compression']) {
       return false;
     }
-    // Use compression for all other requests
     return compression.filter(req, res);
   },
 }));
 
-// Rate limiting - General API rate limit
-const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.',
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
-});
+// ============================================
+// CORS CONFIGURATION - FIXED VERSION
+// ============================================
 
-// Apply general rate limiting to all API routes
-app.use('/api/', generalLimiter);
-
-// CORS configuration
-// CORS configuration - Allow Vercel and localhost
 const corsOptions = {
   origin: function (origin, callback) {
     const allowedOrigins = [
@@ -144,13 +132,13 @@ const corsOptions = {
       'http://localhost:5000'
     ];
     
-    // Allow requests with no origin (Postman, mobile apps, etc.)
+    // Allow requests with no origin (Postman, mobile apps, server-to-server, etc.)
     if (!origin) {
       return callback(null, true);
     }
     
-    // Allow all Vercel preview/deployment URLs
-    if (origin.endsWith('.vercel.app')) {
+    // Allow ALL Vercel deployment URLs (production and preview)
+    if (origin.includes('vercel.app')) {
       return callback(null, true);
     }
     
@@ -159,16 +147,54 @@ const corsOptions = {
       return callback(null, true);
     }
     
-    // Reject others
-    callback(new Error('Not allowed by CORS'));
+    // Log rejected origins for debugging
+    console.warn(`⚠️  CORS blocked origin: ${origin}`);
+    
+    // Reject with error
+    return callback(new Error('Not allowed by CORS'), false);
   },
   credentials: true,
   optionsSuccessStatus: 200,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'],
+  allowedHeaders: [
+    'Content-Type', 
+    'Authorization', 
+    'X-Requested-With',
+    'Accept',
+    'Origin',
+    'Access-Control-Request-Method',
+    'Access-Control-Request-Headers'
+  ],
+  exposedHeaders: [
+    'X-Metro-Delta-ID', 
+    'X-Metro-Files-Changed-Count',
+    'Content-Length',
+    'Content-Type'
+  ],
+  maxAge: 86400 // 24 hours - cache preflight requests
 };
 
+// Apply CORS middleware BEFORE rate limiting
 app.use(cors(corsOptions));
+
+// Handle preflight requests explicitly
+app.options('*', cors(corsOptions));
+
+// ============================================
+// END CORS CONFIGURATION
+// ============================================
+
+// Rate limiting - General API rate limit
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Apply general rate limiting to all API routes
+app.use('/api/', generalLimiter);
 
 // Body parser middleware
 app.use(express.json({ limit: '10mb' }));
@@ -195,23 +221,22 @@ app.use(requestLogger);
 
 // Request timeout middleware
 const requestTimeout = require('./middleware/requestTimeout.middleware');
-app.use(requestTimeout(30000)); // 30 second timeout
+app.use(requestTimeout(30000));
 
 // Performance monitoring middleware
 const { performanceMonitor, responseTimeHeader } = require('./middleware/performance.middleware');
-app.use(performanceMonitor(1000)); // Log requests slower than 1 second
+app.use(performanceMonitor(1000));
 app.use(responseTimeHeader);
 
 // MongoDB connection with improved configuration
 const mongooseOptions = {
   useNewUrlParser: true,
   useUnifiedTopology: true,
-  maxPoolSize: 10, // Maintain up to 10 socket connections
-  serverSelectionTimeoutMS: 5000, // Keep trying to send operations for 5 seconds
-  socketTimeoutMS: 45000, // Close sockets after 45 seconds of inactivity
-  family: 4, // Use IPv4, skip trying IPv6
-  bufferCommands: false, // Disable mongoose buffering
-  // Note: bufferMaxEntries is deprecated and removed in newer MongoDB drivers
+  maxPoolSize: 10,
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 45000,
+  family: 4,
+  bufferCommands: false,
 };
 
 mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/gidi-blog', mongooseOptions)
@@ -220,17 +245,14 @@ mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/gidi-blog
   console.log(`   Database: ${mongoose.connection.name}`);
   console.log(`   Host: ${mongoose.connection.host}`);
   
-  // Initialize default admin accounts after successful DB connection
   try {
     await initializeAdmins();
   } catch (error) {
     console.error('⚠️  Error initializing admins:', error.message);
-    // Don't exit, continue server startup
   }
 })
 .catch((err) => {
   console.error('❌ MongoDB connection error:', err.message);
-  // Retry connection after 5 seconds
   setTimeout(() => {
     console.log('🔄 Retrying MongoDB connection...');
     mongoose.connect(process.env.MONGODB_URI || process.env.MONGODB_URI_PROD, mongooseOptions)
@@ -272,7 +294,6 @@ app.get('/health', async (req, res) => {
     },
   };
 
-  // Check MongoDB connection
   try {
     if (mongoose.connection.readyState === 1) {
       await mongoose.connection.db.admin().ping();
@@ -371,7 +392,6 @@ app.use(errorHandler);
 // Start server
 const PORT = process.env.PORT || 5000;
 
-// Handle port already in use error
 const server = app.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
   console.log(`   API URL: http://localhost:${PORT}/api`);
@@ -390,25 +410,21 @@ const server = app.listen(PORT, () => {
 
 // Initialize WebSocket server
 websocketService.initialize(server);
-console.log('WebSocket server initialized');
-
+console.log('✅ WebSocket server initialized');
 
 // Graceful shutdown handler
 const gracefulShutdown = async (signal) => {
   console.log(`\n${signal} signal received: starting graceful shutdown...`);
   
-  // Stop accepting new requests
   server.close(async () => {
     console.log('✅ HTTP server closed');
     
     try {
-      // Close MongoDB connection
       if (mongoose.connection.readyState === 1) {
         await mongoose.connection.close();
         console.log('✅ MongoDB connection closed');
       }
       
-      // Close queue connections (if using Redis-based queues)
       try {
         const queueService = require('./services/queue/queue.service');
         if (queueService && typeof queueService.closeAll === 'function') {
@@ -416,7 +432,6 @@ const gracefulShutdown = async (signal) => {
           console.log('✅ Queue connections closed');
         }
       } catch (err) {
-        // Queue service may not be available or may not use Redis
         console.warn('⚠️  Queue close skipped:', err.message);
       }
       
@@ -428,7 +443,6 @@ const gracefulShutdown = async (signal) => {
     }
   });  
   
-  // Force close after 10 seconds
   setTimeout(() => {
     console.error('❌ Forcing shutdown after timeout');
     process.exit(1);
@@ -439,7 +453,6 @@ const gracefulShutdown = async (signal) => {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-
 // Handle uncaught exceptions
 process.on('uncaughtException', (err) => {
   console.error('❌ Uncaught Exception:', err);
@@ -449,10 +462,6 @@ process.on('uncaughtException', (err) => {
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
   console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-  // Log but don't exit - let the application continue
 });
 
-// Remove duplicate SIGTERM handler - gracefulShutdown handles it
-
 module.exports = app;
-
