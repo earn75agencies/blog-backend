@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 /**
- * Post Schema
+ * Optimized Post Schema - Reduced indexes for better write performance
  */
 const postSchema = new mongoose.Schema(
   {
@@ -65,14 +65,12 @@ const postSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
-    likes: [
-      {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User',
-      },
-    ],
+    likesCount: {  // CHANGED: Store count instead of array for better performance
+      type: Number,
+      default: 0,
+    },
     readingTime: {
-      type: Number, // in minutes
+      type: Number,
       default: 0,
     },
     seoTitle: {
@@ -83,11 +81,7 @@ const postSchema = new mongoose.Schema(
       type: String,
       maxlength: [160, 'SEO description cannot exceed 160 characters'],
     },
-    seoKeywords: [
-      {
-        type: String,
-      },
-    ],
+    seoKeywords: [String],
     isFeatured: {
       type: Boolean,
       default: false,
@@ -100,7 +94,6 @@ const postSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
-    // Versioning support
     currentVersion: {
       type: Number,
       default: 1,
@@ -109,19 +102,16 @@ const postSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
-    // Content type
     contentType: {
       type: String,
       enum: ['text', 'video', 'audio', 'podcast', 'vr', 'ar', 'mixed', 'interactive'],
       default: 'text',
     },
-    // Licensing
     licenseType: {
       type: String,
       enum: ['all-rights-reserved', 'cc-by', 'cc-by-sa', 'cc-by-nc', 'cc-by-nc-sa', 'cc-by-nd', 'cc-by-nc-nd', 'public-domain', 'custom'],
       default: 'all-rights-reserved',
     },
-    // Paid content
     isPaid: {
       type: Boolean,
       default: false,
@@ -134,7 +124,6 @@ const postSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
-    // Accessibility
     accessibilityScore: {
       type: Number,
       default: 0,
@@ -145,7 +134,6 @@ const postSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
-    // VR/AR content
     hasVRContent: {
       type: Boolean,
       default: false,
@@ -154,7 +142,6 @@ const postSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'VRContent',
     },
-    // Collaborative editing
     isCollaborative: {
       type: Boolean,
       default: false,
@@ -163,7 +150,6 @@ const postSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'CollaborativePost',
     },
-    // Content features
     hasTextToSpeech: {
       type: Boolean,
       default: false,
@@ -180,21 +166,17 @@ const postSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'InteractiveContent',
     },
-    // Regional targeting
     targetRegions: [String],
     targetLanguages: [String],
-    // Content expiration
     expiresAt: Date,
     autoArchive: {
       type: Boolean,
       default: false,
     },
-    // Editorial
     hasEditorialNotes: {
       type: Boolean,
       default: false,
     },
-    // AI features
     aiGenerated: {
       type: Boolean,
       default: false,
@@ -209,14 +191,12 @@ const postSchema = new mongoose.Schema(
       min: 0,
       max: 100,
     },
-    // Content quality
     qualityScore: {
       type: Number,
       default: 0,
       min: 0,
       max: 100,
     },
-    // Engagement metrics
     engagementScore: {
       type: Number,
       default: 0,
@@ -226,23 +206,20 @@ const postSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
-    // Precomputed ranking fields for performance (updated by background jobs)
     rankingScore: {
       type: Number,
       default: 0,
-      index: true, // For trending/popular posts
+      index: true,
     },
     boost: {
       type: Number,
-      default: 0, // Manual boost for featured content
+      default: 0,
       index: true,
     },
-    // Cursor pagination support - composite key
     cursor: {
-      type: String, // Format: timestamp_id (e.g., "1234567890_abc123")
+      type: String,
       index: true,
     },
-    // Subcategories
     subcategories: [
       {
         type: mongoose.Schema.Types.ObjectId,
@@ -257,40 +234,57 @@ const postSchema = new mongoose.Schema(
   }
 );
 
-// Critical indexes for unlimited scalability and cursor pagination
-postSchema.index({ slug: 1 }, { unique: true });
-postSchema.index({ author: 1, createdAt: -1, _id: 1 }); // Cursor pagination for user posts
-postSchema.index({ category: 1, status: 1, publishedAt: -1, _id: 1 }); // Category posts with cursor
-postSchema.index({ status: 1, publishedAt: -1, _id: 1 }); // Main feed cursor pagination
-postSchema.index({ tags: 1, status: 1, publishedAt: -1 }); // Tag-based queries
-postSchema.index({ isFeatured: 1, publishedAt: -1, _id: 1 }); // Featured posts
-postSchema.index({ rankingScore: -1, publishedAt: -1 }); // Trending/popular posts
-postSchema.index({ boost: -1, publishedAt: -1 }); // Boosted content
-postSchema.index({ cursor: 1 }); // Cursor-based pagination
-postSchema.index({ createdAt: -1, _id: 1 }); // Default chronological order
-postSchema.index({ views: -1 }); // Most viewed
-postSchema.index({ 'likes': 1 }); // Likes count (array size)
-postSchema.index({ title: 'text', content: 'text', excerpt: 'text' }); // Full-text search (fallback, ES is primary)
-postSchema.index({ title: 'text', content: 'text', excerpt: 'text' });
-postSchema.index({ contentType: 1, status: 1 });
-postSchema.index({ isPaid: 1, status: 1 });
-postSchema.index({ hasVRContent: 1 });
-postSchema.index({ isCollaborative: 1 });
-postSchema.index({ viralityScore: -1 });
-postSchema.index({ engagementScore: -1 });
-postSchema.index({ expiresAt: 1 });
-postSchema.index({ targetRegions: 1 });
-postSchema.index({ accessibilityScore: -1 });
+// ===== CRITICAL INDEXES ONLY (Reduced from 26+ to 10) =====
 
-// Virtual for comments
+// 1. Unique slug for lookups
+postSchema.index({ slug: 1 }, { unique: true });
+
+// 2. Main feed pagination (most common query)
+postSchema.index({ status: 1, publishedAt: -1, _id: 1 });
+
+// 3. User's posts
+postSchema.index({ author: 1, status: 1, createdAt: -1 });
+
+// 4. Category filtering
+postSchema.index({ category: 1, status: 1, publishedAt: -1 });
+
+// 5. Featured posts
+postSchema.index({ isFeatured: 1, status: 1, publishedAt: -1 });
+
+// 6. Trending/popular (ranking-based)
+postSchema.index({ status: 1, rankingScore: -1, publishedAt: -1 });
+
+// 7. Tag filtering (keep if heavily used)
+postSchema.index({ tags: 1, status: 1, publishedAt: -1 });
+
+// 8. Most viewed posts
+postSchema.index({ status: 1, views: -1 });
+
+// 9. Cursor pagination
+postSchema.index({ cursor: 1 });
+
+// 10. Full-text search (ONLY ONE - REMOVED DUPLICATE!)
+postSchema.index({ title: 'text', content: 'text', excerpt: 'text' });
+
+// REMOVED INDEXES (move these queries to application layer or use less frequently):
+// - contentType compound index (query in memory if needed)
+// - isPaid compound index (filter in application)
+// - hasVRContent, isCollaborative (low cardinality, poor index performance)
+// - viralityScore, accessibilityScore (not frequently queried)
+// - expiresAt (use TTL index if needed or background job)
+// - targetRegions (array index, expensive)
+// - likes array index (replaced with likesCount)
+
+// Virtual for comments (only populate when explicitly needed)
 postSchema.virtual('comments', {
   ref: 'Comment',
   localField: '_id',
   foreignField: 'post',
 });
 
-// Pre-save middleware to generate slug, cursor, and reading time
+// Pre-save middleware (lightweight operations only)
 postSchema.pre('save', function (next) {
+  // Generate slug
   if (this.isModified('title') && !this.slug) {
     this.slug = this.title
       .toLowerCase()
@@ -298,19 +292,19 @@ postSchema.pre('save', function (next) {
       .replace(/^-+|-+$/g, '');
   }
 
-  // Generate cursor for pagination (timestamp_id format)
+  // Generate cursor
   if (this.isNew || this.isModified('createdAt')) {
     const timestamp = this.createdAt ? this.createdAt.getTime() : Date.now();
     this.cursor = `${timestamp}_${this._id}`;
   }
 
-  // Calculate reading time (average 200 words per minute)
+  // Calculate reading time
   if (this.isModified('content')) {
     const wordCount = this.content.split(/\s+/).length;
     this.readingTime = Math.ceil(wordCount / 200);
   }
 
-  // Set publishedAt when status changes to published
+  // Set publishedAt
   if (this.isModified('status') && this.status === 'published' && !this.publishedAt) {
     this.publishedAt = new Date();
   }
@@ -318,47 +312,46 @@ postSchema.pre('save', function (next) {
   next();
 });
 
-// Post-save hook to update ranking score (can be moved to background job)
-postSchema.post('save', async function () {
-  // Update ranking score asynchronously (non-blocking)
-  setImmediate(async () => {
-    const viewsWeight = 0.3;
-    const likesWeight = 0.4;
-    const commentsWeight = 0.2;
-    const boostWeight = 0.1;
-    
-    const rankingScore = 
-      (this.views || 0) * viewsWeight +
-      (this.likes?.length || 0) * likesWeight +
-      (this.commentsCount || 0) * commentsWeight +
-      (this.boost || 0) * boostWeight;
-    
+// REMOVED: Blocking post-save hook for ranking score
+// Instead, update ranking scores via:
+// 1. Background job (every 15-30 minutes)
+// 2. Queue system (Bull/BullMQ)
+// 3. Only when engagement metrics change significantly
+
+// Method to increment views (optimized)
+postSchema.methods.incrementViews = async function () {
+  // Use atomic update instead of save
+  await mongoose.model('Post').updateOne(
+    { _id: this._id },
+    { $inc: { views: 1 } }
+  );
+};
+
+// Method to toggle like (optimized with separate PostLike collection recommended)
+postSchema.methods.toggleLike = async function (userId) {
+  // Instead of storing array, increment/decrement counter
+  // You should create a separate PostLike collection for scalability
+  const Like = mongoose.model('PostLike');
+  const existingLike = await Like.findOne({ post: this._id, user: userId });
+  
+  if (existingLike) {
+    await existingLike.deleteOne();
     await mongoose.model('Post').updateOne(
       { _id: this._id },
-      { rankingScore: Math.round(rankingScore) }
+      { $inc: { likesCount: -1 } }
     );
-  });
-});
-
-// Method to increment views
-postSchema.methods.incrementViews = async function () {
-  this.views += 1;
-  await this.save();
-};
-
-// Method to toggle like
-postSchema.methods.toggleLike = async function (userId) {
-  const index = this.likes.indexOf(userId);
-  if (index > -1) {
-    this.likes.splice(index, 1);
+    return this.likesCount - 1;
   } else {
-    this.likes.push(userId);
+    await Like.create({ post: this._id, user: userId });
+    await mongoose.model('Post').updateOne(
+      { _id: this._id },
+      { $inc: { likesCount: 1 } }
+    );
+    return this.likesCount + 1;
   }
-  await this.save();
-  return this.likes.length;
 };
 
-// Static method to find published posts
+// Static methods
 postSchema.statics.findPublished = function (query = {}) {
   return this.find({
     ...query,
@@ -367,7 +360,6 @@ postSchema.statics.findPublished = function (query = {}) {
   });
 };
 
-// Static method to search posts (fallback - ES is primary)
 postSchema.statics.searchPosts = function (searchTerm) {
   return this.find({
     $text: { $search: searchTerm },
@@ -376,9 +368,8 @@ postSchema.statics.searchPosts = function (searchTerm) {
   }).sort({ score: { $meta: 'textScore' } });
 };
 
-// Static method for cursor-based pagination
 postSchema.statics.paginateWithCursor = function (query = {}, options = {}) {
-  const limit = Math.min(options.limit || 20, 100); // Max 100 per page
+  const limit = Math.min(options.limit || 20, 100);
   let mongoQuery = this.find(query);
   
   if (options.cursor) {
@@ -393,11 +384,10 @@ postSchema.statics.paginateWithCursor = function (query = {}, options = {}) {
   
   return mongoQuery
     .sort({ createdAt: -1, _id: -1 })
-    .limit(limit + 1) // Fetch one extra to determine if there's a next page
+    .limit(limit + 1)
     .lean();
 };
 
 const Post = mongoose.model('Post', postSchema);
 
 module.exports = Post;
-
