@@ -134,25 +134,37 @@ const generalLimiter = rateLimit({
 app.use('/api/', generalLimiter);
 
 // CORS configuration
+// CORS configuration - Allow Vercel and localhost
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    // or allow requests from frontend URL
     const allowedOrigins = [
-      process.env.FRONTEND_URL || 'http://localhost:3000',
+      'https://blog-frontend-nine-virid.vercel.app',
       'http://localhost:3000',
-      'http://127.0.0.1:3000'
+      'http://localhost:5173',
+      'http://localhost:5000'
     ];
     
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
+    // Allow requests with no origin (Postman, mobile apps, etc.)
+    if (!origin) {
+      return callback(null, true);
     }
+    
+    // Allow all Vercel preview/deployment URLs
+    if (origin.endsWith('.vercel.app')) {
+      return callback(null, true);
+    }
+    
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // Reject others
+    callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
   optionsSuccessStatus: 200,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 };
 
