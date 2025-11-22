@@ -1,0 +1,74 @@
+{
+  "name": "gidix-backend",
+  "version": "1.0.0",
+  "description": "Backend API for Gidix Site",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "dev:clean": "node scripts/kill-port.js 5000 && npm run dev",
+    "kill-port": "node scripts/kill-port.js",
+    "test": "jest",
+    "test:connectivity": "node scripts/testConnectivity.js",
+    "migrate": "node scripts/migrate.js"
+  },
+  "keywords": [
+    "blog",
+    "api",
+    "express",
+    "mongodb"
+  ],
+  "author": "Gidi",
+  "license": "MIT",
+  "dependencies": {
+    "@elastic/elasticsearch": "^8.11.0",
+    "aws-sdk": "^2.1500.0",
+    "axios": "^1.6.0",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.8.0",
+    "compression": "^1.7.4",
+    "connect-mongo": "^5.1.0",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "date-fns": "^2.30.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.1.3",
+    "express-session": "^1.17.3",
+    "express-validator": "^7.0.1",
+    "firebase-admin": "^13.6.0",
+    "helmet": "^7.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^7.5.0",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "natural": "^6.5.0",
+    "node-cache": "^5.1.2",
+    "nodemailer": "^7.0.10",
+    "openai": "^4.20.0",
+    "rss": "^1.2.2",
+    "sanitize-html": "^2.11.0",
+    "socket.io": "^4.6.1",
+    "stripe": "^14.0.0",
+    "uuid": "^9.0.1",
+    "web-push": "^3.6.0",
+    "winston": "^3.18.3",
+    "xss": "^1.0.15"
+  },
+  "devDependencies": {
+    "jest": "^25.0.0",
+    "mongodb-memory-server": "^9.1.3",
+    "nodemon": "^3.1.11",
+    "supertest": "^6.3.3"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverage": true,
+    "coverageDirectory": "coverage",
+    "coverageReporters": [
+      "text",
+      "lcov",
+      "html"
+    ]
+  }
+}

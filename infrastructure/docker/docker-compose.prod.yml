@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:6
+    container_name: gidi-blog-mongodb-prod
+    restart: always
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+      MONGO_INITDB_DATABASE: gidiblog
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - gidi-blog-network
+
+  backend:
+    build:
+      context: ../..
+      dockerfile: backend/infrastructure/docker/Dockerfile.backend
+    container_name: gidi-blog-backend-prod
+    restart: always
+    ports:
+      - "5000:5000"
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@mongodb:27017/gidiblog?authSource=admin
+      PORT: 5000
+    depends_on:
+      - mongodb
+    networks:
+      - gidi-blog-network
+
+volumes:
+  mongodb_data:
+
+networks:
+  gidi-blog-network:
+    driver: bridge
+
