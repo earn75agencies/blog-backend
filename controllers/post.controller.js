@@ -1,39 +1,12 @@
-const Post = require('../models/Post.model');
-const Category = require('../models/Category.model');
-const Tag = require('../models/Tag.model');
-const { asyncHandler } = require('../utils/asyncHandler');
-const ErrorResponse = require('../utils/ErrorResponse');
-const CacheUtil = require('../utils/cache.util');
-const notificationService = require('../services/notification.service');
-const { uploadImage, deleteImage } = require('../config/cloudinary.config');
-const { randomString } = require('../utils/string.util');
+const Post = require('../models/Post');
+const postValidator = require('../validators/postValidator');
+const { asyncHandler, APIError } = require('../middleware/errorMiddleware');
+const ErrorResponse = require('../utils/errorResponse');
+const CacheUtil = require('../utils/cacheUtil');
 
 /**
- * Generate a unique slug for a post
- * @param {string} baseSlug - The base slug generated from title
- * @returns {Promise<string>} Unique slug
- */
-const generateUniqueSlug = async (baseSlug) => {
-  let slug = baseSlug;
-  let counter = 1;
-  
-  while (await Post.findOne({ slug })) {
-    // Append random suffix to make it unique
-    slug = `${baseSlug}-${randomString(5, 'abcdefghijklmnopqrstuvwxyz0123456789')}`;
-    counter++;
-    // Prevent infinite loop - max 10 attempts
-    if (counter > 10) {
-      slug = `${baseSlug}-${Date.now()}`;
-      break;
-    }
-  }
-  
-  return slug;
-};
-
-/**
- * @desc    Get all posts (supports both cursor and offset pagination)
- * @route   GET /api/posts?cursor=&limit=20
+ * @desc    Get all posts with filtering and pagination (supports both cursor and offset)
+ * @route   GET /api/posts
  * @access  Public
  */
 exports.getPosts = asyncHandler(async (req, res) => {
@@ -46,6 +19,12 @@ exports.getPosts = asyncHandler(async (req, res) => {
     status: 'published',
     publishedAt: { $lte: new Date() },
   };
+
+  // If user is admin, they can see all posts (including drafts)
+  if (req.query.status === 'all' && req.isAdmin) {
+    delete baseQuery.status;
+    delete baseQuery.publishedAt;
+  }
 
   // Filter by category
   if (req.query.category) {
@@ -63,6 +42,20 @@ exports.getPosts = asyncHandler(async (req, res) => {
     baseQuery.author = req.query.author;
   }
 
+  // Filter by featured
+  if (req.query.featured === 'true') {
+    baseQuery.isFeatured = true;
+  }
+
+  // Search functionality
+  if (req.query.search) {
+    baseQuery.$or = [
+      { title: { $regex: req.query.search, $options: 'i' } },
+      { content: { $regex: req.query.search, $options: 'i' } },
+      { excerpt: { $regex: req.query.search, $options: 'i' } }
+    ];
+  }
+
   if (useCursor) {
     // Cursor-based pagination (recommended for unlimited scalability)
     const posts = await Post.paginateWithCursor(baseQuery, { cursor, limit });
@@ -73,11 +66,27 @@ exports.getPosts = asyncHandler(async (req, res) => {
       ? results[results.length - 1].cursor 
       : null;
 
+    // Add isLiked status for each post if user is authenticated
+    let postsWithLikeStatus = results;
+    if (req.user) {
+      postsWithLikeStatus = results.map(post => ({
+        ...post,
+        isLiked: post.likedBy && post.likedBy.some(userId => userId.toString() === req.user._id.toString()),
+      }));
+    } else {
+      postsWithLikeStatus = results.map(post => ({
+        ...post,
+        isLiked: false,
+      }));
+    }
+
     res.json({
       status: 'success',
+      success: true,
       results: results.length,
+      count: results.length,
       data: {
-        posts: results,
+        posts: postsWithLikeStatus,
       },
       pagination: {
         hasMore,
@@ -98,14 +107,31 @@ exports.getPosts = asyncHandler(async (req, res) => {
       .populate('tags', 'name slug')
       .skip(skip)
       .limit(limit)
-      .sort({ [sortBy]: sortOrder })
+      .sort({ [sortBy]: sortOrder, createdAt: -1 })
       .lean();
 
     const total = await Post.countDocuments(baseQuery);
 
+    // Add isLiked status for each post if user is authenticated
+    let postsWithLikeStatus = posts;
+    if (req.user) {
+      postsWithLikeStatus = posts.map(post => ({
+        ...post,
+        isLiked: post.likedBy && post.likedBy.some(userId => userId.toString() === req.user._id.toString()),
+      }));
+    } else {
+      postsWithLikeStatus = posts.map(post => ({
+        ...post,
+        isLiked: false,
+      }));
+    }
+
     res.json({
       status: 'success',
+      success: true,
       results: posts.length,
+      count: posts.length,
+      total,
       pagination: {
         page,
         limit,
@@ -113,31 +139,57 @@ exports.getPosts = asyncHandler(async (req, res) => {
         pages: Math.ceil(total / limit),
       },
       data: {
-        posts,
+        posts: postsWithLikeStatus,
       },
+      posts: postsWithLikeStatus,
     });
   }
 });
 
+// Alias for backward compatibility
+exports.getAllPosts = exports.getPosts;
+
 /**
  * @desc    Get single post
- * @route   GET /api/posts/:slug
+ * @route   GET /api/posts/:slug or GET /api/posts/:id
  * @access  Public
  */
 exports.getPost = asyncHandler(async (req, res) => {
-  const post = await Post.findOne({ slug: req.params.slug })
-    .populate('author', 'username avatar firstName lastName bio')
-    .populate('category', 'name slug description')
-    .populate('tags', 'name slug')
-    .populate({
-      path: 'comments',
-      match: { isApproved: true, isSpam: false },
-      populate: {
-        path: 'author',
-        select: 'username avatar firstName lastName',
-      },
-      options: { sort: { createdAt: -1 } },
-    });
+  const identifier = req.params.slug || req.params.id;
+  let post;
+
+  // Try to find by slug first, then by ID
+  if (identifier.match(/^[0-9a-fA-F]{24}$/)) {
+    // It's a valid MongoDB ObjectId
+    post = await Post.findById(identifier)
+      .populate('author', 'username avatar firstName lastName bio')
+      .populate('category', 'name slug description')
+      .populate('tags', 'name slug')
+      .populate({
+        path: 'comments',
+        match: { isApproved: true, isSpam: false },
+        populate: {
+          path: 'author user',
+          select: 'username avatar firstName lastName',
+        },
+        options: { sort: { createdAt: -1 } },
+      });
+  } else {
+    // Assume it's a slug
+    post = await Post.findOne({ slug: identifier })
+      .populate('author', 'username avatar firstName lastName bio')
+      .populate('category', 'name slug description')
+      .populate('tags', 'name slug')
+      .populate({
+        path: 'comments',
+        match: { isApproved: true, isSpam: false },
+        populate: {
+          path: 'author user',
+          select: 'username avatar firstName lastName',
+        },
+        options: { sort: { createdAt: -1 } },
+      });
+  }
 
   if (!post) {
     throw new ErrorResponse('Post not found', 404);
@@ -145,613 +197,530 @@ exports.getPost = asyncHandler(async (req, res) => {
 
   // Only show published posts to non-authors
   if (post.status !== 'published') {
-    if (!req.user || (req.user._id.toString() !== post.author._id.toString() && req.user.role !== 'admin')) {
+    if (!req.user || (req.user._id.toString() !== post.author._id.toString() && !req.isAdmin)) {
       throw new ErrorResponse('Post not found', 404);
     }
   }
 
   // Increment views (only for published posts)
   if (post.status === 'published') {
-    await post.incrementViews();
+    if (post.incrementViews) {
+      await post.incrementViews();
+    } else {
+      post.views = (post.views || 0) + 1;
+      await post.save({ validateBeforeSave: false });
+    }
+  }
+
+  // Check if current user has liked the post
+  let isLiked = false;
+  if (req.user) {
+    const likedBy = post.likedBy || post.likes || [];
+    isLiked = likedBy.some(userId => userId.toString() === req.user._id.toString());
+  }
+
+  // Convert post to object and add isLiked
+  const postObj = post.toObject();
+  
+  // Convert sharesByPlatform Map to Object if it exists
+  if (postObj.sharesByPlatform && postObj.sharesByPlatform instanceof Map) {
+    const sharesByPlatform = {};
+    postObj.sharesByPlatform.forEach((value, key) => {
+      sharesByPlatform[key] = value;
+    });
+    postObj.sharesByPlatform = sharesByPlatform;
   }
 
   res.json({
     status: 'success',
+    success: true,
     data: {
-      post,
+      post: {
+        ...postObj,
+        isLiked,
+      },
+    },
+    post: {
+      ...postObj,
+      isLiked,
     },
   });
 });
 
+// Aliases for backward compatibility
+exports.getPostById = exports.getPost;
+exports.getPostBySlug = exports.getPost;
+
 /**
- * @desc    Create post
+ * @desc    Create new post
  * @route   POST /api/posts
- * @access  Private/Author
+ * @access  Private
  */
 exports.createPost = asyncHandler(async (req, res) => {
-  const {
-    title,
-    excerpt,
-    content,
-    category,
-    tags,
-    status,
-    seoTitle,
-    seoDescription,
-    seoKeywords,
-    isFeatured,
-    allowComments,
-  } = req.body;
-
-  // Verify category exists
-  const categoryDoc = await Category.findById(category);
-  if (!categoryDoc) {
-    throw new ErrorResponse('Category not found', 404);
-  }
-
-  // Process tags
-  let tagIds = [];
-  if (tags && tags.length > 0) {
-    for (const tagName of tags) {
-      let tag = await Tag.findOne({ name: tagName.toLowerCase() });
-      if (!tag) {
-        tag = await Tag.create({ name: tagName.toLowerCase() });
-      }
-      tagIds.push(tag._id);
-      await tag.incrementUsage();
+  const isAdmin = req.isAdmin || false;
+  
+  const errors = postValidator.validateCreate(req.body, isAdmin);
+  if (errors) {
+    if (isAdmin) {
+      console.warn('Admin post creation validation warnings (proceeding anyway):', errors);
+      // Auto-fix ALL issues for admins
+      req.body.title = req.body.title || 'Admin Post';
+      req.body.content = req.body.content || req.body.description || 'Content created by admin';
+      req.body.excerpt = req.body.excerpt || (req.body.content ? req.body.content.substring(0, 150) + '...' : 'Admin post');
+      req.body.featuredImage = req.body.featuredImage || '/images/default-post.jpg';
+      req.body.status = req.body.status || 'published';
+      req.body.category = req.body.category || 'update';
+    } else {
+      return res.status(400).json({ success: false, errors });
     }
   }
 
-  // Get featured image from uploaded file or URL
-  let featuredImage = req.body.featuredImage;
-  
-  // If file is uploaded, upload to Cloudinary first
-  if (req.file) {
-    try {
-      const uploadedResult = await uploadImage(req.file.path);
-      featuredImage = uploadedResult.secure_url; // Use Cloudinary URL
-    } catch (error) {
-      throw new ErrorResponse('Failed to upload image: ' + error.message, 500);
-    }
+  let post;
+  if (isAdmin) {
+    // Ensure all required fields exist
+    req.body.title = req.body.title || 'Admin Post';
+    req.body.content = req.body.content || 'Content created by admin';
+    req.body.excerpt = req.body.excerpt || (req.body.content ? req.body.content.substring(0, 150) + '...' : 'Admin post');
+    req.body.featuredImage = req.body.featuredImage || '/images/default-post.jpg';
+    req.body.category = req.body.category || 'update';
+    req.body.status = req.body.status || 'published';
+    
+    post = new Post({
+      ...req.body,
+      author: req.user._id,
+      status: req.body.status || 'published'
+    });
+    await post.save({ validateBeforeSave: false });
+  } else {
+    post = await Post.create({
+      ...req.body,
+      author: req.user._id,
+      status: req.body.status || 'draft'
+    });
   }
 
-  // Generate slug from title
-  let baseSlug = title
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  
-  // Ensure slug is unique
-  const slug = await generateUniqueSlug(baseSlug);
-
-  const post = await Post.create({
-    title,
-    slug,
-    excerpt,
-    content,
-    category,
-    tags: tagIds,
-    author: req.user._id,
-    status: status || 'draft',
-    featuredImage,
-    seoTitle,
-    seoDescription,
-    seoKeywords: seoKeywords ? (Array.isArray(seoKeywords) ? seoKeywords : seoKeywords.split(',')) : [],
-    isFeatured: isFeatured || false,
-    allowComments: allowComments !== undefined ? allowComments : true,
-  });
-
-  const populatedPost = await Post.findById(post._id)
-    .populate('author', 'username avatar firstName lastName')
-    .populate('category', 'name slug')
-    .populate('tags', 'name slug');
-
-  // Clear cache - clear all featured and related post caches
-  // Note: In production, use Redis with pattern matching for better cache invalidation
+  await post.populate('author', 'firstName lastName avatar username');
 
   res.status(201).json({
+    success: true,
     status: 'success',
     message: 'Post created successfully',
-    data: {
-      post: populatedPost,
-    },
+    post,
+    data: { post },
+    ...(isAdmin && Object.keys(errors || {}).length > 0 && { 
+      warnings: 'Some validations were bypassed for admin' 
+    })
   });
 });
 
 /**
  * @desc    Update post
  * @route   PUT /api/posts/:id
- * @access  Private/Author
+ * @access  Private
  */
 exports.updatePost = asyncHandler(async (req, res) => {
-  const post = await Post.findById(req.params.id);
+  const isAdmin = req.isAdmin || false;
+  
+  let post = await Post.findById(req.params.id);
+
   if (!post) {
     throw new ErrorResponse('Post not found', 404);
   }
 
   // Check authorization
-  if (post.author.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+  if (post.author.toString() !== req.user._id.toString() && !isAdmin) {
     throw new ErrorResponse('Not authorized to update this post', 403);
   }
 
-  const {
-    title,
-    excerpt,
-    content,
-    category,
-    tags,
-    status,
-    seoTitle,
-    seoDescription,
-    seoKeywords,
-    isFeatured,
-    allowComments,
-  } = req.body;
-
-  // Update category if provided
-  if (category) {
-    const categoryDoc = await Category.findById(category);
-    if (!categoryDoc) {
-      throw new ErrorResponse('Category not found', 404);
-    }
-    post.category = category;
-  }
-
-  // Update tags if provided
-  if (tags && tags.length > 0) {
-    // Decrement usage for old tags
-    for (const oldTagId of post.tags) {
-      const oldTag = await Tag.findById(oldTagId);
-      if (oldTag) {
-        await oldTag.decrementUsage();
+  const errors = postValidator.validateUpdate(req.body, isAdmin);
+  if (errors) {
+    if (isAdmin) {
+      console.warn('Admin post update validation warnings (proceeding anyway):', errors);
+      // Auto-fix any issues
+      if (req.body.title === undefined || !req.body.title) req.body.title = post.title || 'Admin Post';
+      if (req.body.content === undefined || !req.body.content) req.body.content = post.content || 'Content created by admin';
+      if (req.body.category && !['news', 'announcement', 'achievement', 'event-recap', 'blog', 'update'].includes(req.body.category)) {
+        req.body.category = 'update';
       }
+    } else {
+      return res.status(400).json({ success: false, errors });
     }
-
-    // Process new tags
-    let tagIds = [];
-    for (const tagName of tags) {
-      let tag = await Tag.findOne({ name: tagName.toLowerCase() });
-      if (!tag) {
-        tag = await Tag.create({ name: tagName.toLowerCase() });
-      }
-      tagIds.push(tag._id);
-      await tag.incrementUsage();
-    }
-    post.tags = tagIds;
   }
 
-  // Update other fields
-  if (title) post.title = title;
-  if (excerpt) post.excerpt = excerpt;
-  if (content) post.content = content;
-  if (status) post.status = status;
-  if (seoTitle) post.seoTitle = seoTitle;
-  if (seoDescription) post.seoDescription = seoDescription;
-  if (seoKeywords !== undefined) {
-    post.seoKeywords = Array.isArray(seoKeywords) ? seoKeywords : seoKeywords.split(',');
-  }
-  if (isFeatured !== undefined) post.isFeatured = isFeatured;
-  if (allowComments !== undefined) post.allowComments = allowComments;
-
-  // Update featured image if provided
-  if (req.file) {
-    // Delete old image from Cloudinary if exists
-    if (post.featuredImage && post.featuredImage.includes('cloudinary.com')) {
-      try {
-        await deleteImage(post.featuredImage);
-      } catch (error) {
-        console.warn('Failed to delete old image from Cloudinary:', error.message);
-      }
+  // For admins, auto-fix any issues before updating
+  if (isAdmin) {
+    if (req.body.title === undefined || !req.body.title) req.body.title = post.title || 'Admin Post';
+    if (req.body.content === undefined || !req.body.content) req.body.content = post.content || 'Content created by admin';
+    if (req.body.excerpt === undefined || !req.body.excerpt) {
+      req.body.excerpt = req.body.content ? req.body.content.substring(0, 150) + '...' : post.excerpt || 'Admin post';
     }
-
-    // Upload new image to Cloudinary
-    try {
-      const uploadedResult = await uploadImage(req.file.path);
-      post.featuredImage = uploadedResult.secure_url; // Use Cloudinary URL
-    } catch (error) {
-      throw new ErrorResponse('Failed to upload image: ' + error.message, 500);
+    if (req.body.featuredImage === undefined || !req.body.featuredImage) {
+      req.body.featuredImage = post.featuredImage || '/images/default-post.jpg';
     }
-  } else if (req.body.featuredImage !== undefined) {
-    // If setting to empty or different URL, delete old image from Cloudinary
-    if (post.featuredImage && 
-        post.featuredImage !== req.body.featuredImage && 
-        post.featuredImage.includes('cloudinary.com')) {
-      try {
-        await deleteImage(post.featuredImage);
-      } catch (error) {
-        console.warn('Failed to delete old image from Cloudinary:', error.message);
-      }
+    if (req.body.category && !['news', 'announcement', 'achievement', 'event-recap', 'blog', 'update'].includes(req.body.category)) {
+      req.body.category = 'update';
     }
-    post.featuredImage = req.body.featuredImage;
   }
 
-  await post.save();
+  Object.keys(req.body).forEach((key) => {
+    post[key] = req.body[key];
+  });
 
-  const updatedPost = await Post.findById(post._id)
-    .populate('author', 'username avatar firstName lastName')
-    .populate('category', 'name slug')
-    .populate('tags', 'name slug');
+  await post.save(isAdmin ? { validateBeforeSave: false } : {});
+  await post.populate('author', 'firstName lastName avatar username');
 
-  // Clear related cache if post was featured
-  if (post.isFeatured) {
-    CacheUtil.del(`posts:featured:5`);
-  }
-  CacheUtil.del(`posts:related:${post._id}:*`);
-
-  res.json({
+  res.status(200).json({
+    success: true,
     status: 'success',
     message: 'Post updated successfully',
-    data: {
-      post: updatedPost,
-    },
+    post,
+    data: { post },
+    ...(isAdmin && Object.keys(errors || {}).length > 0 && { 
+      warnings: 'Some validations were bypassed for admin' 
+    })
   });
 });
 
 /**
  * @desc    Delete post
  * @route   DELETE /api/posts/:id
- * @access  Private/Author
+ * @access  Private
  */
 exports.deletePost = asyncHandler(async (req, res) => {
   const post = await Post.findById(req.params.id);
+
   if (!post) {
     throw new ErrorResponse('Post not found', 404);
   }
 
-  // Check authorization
-  if (post.author.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+  if (post.author.toString() !== req.user._id.toString() && !req.isAdmin) {
     throw new ErrorResponse('Not authorized to delete this post', 403);
   }
 
-  // Decrement tag usage
-  for (const tagId of post.tags) {
-    const tag = await Tag.findById(tagId);
-    if (tag) {
-      await tag.decrementUsage();
-    }
-  }
+  await Post.findByIdAndDelete(req.params.id);
 
-  // Delete featured image from Cloudinary if exists
-  if (post.featuredImage && post.featuredImage.includes('cloudinary.com')) {
-    try {
-      await deleteImage(post.featuredImage);
-    } catch (error) {
-      console.warn('Failed to delete image from Cloudinary:', error.message);
-    }
-  }
-
-  await post.remove();
-
-  // Clear cache
-  CacheUtil.del(`posts:featured:*`);
-  CacheUtil.del(`posts:related:${post._id}:*`);
-
-  res.json({
+  res.status(200).json({
+    success: true,
     status: 'success',
-    message: 'Post deleted successfully',
+    message: 'Post and all comments permanently deleted from database'
   });
 });
 
 /**
- * @desc    Like post
+ * @desc    Like/Unlike post
  * @route   POST /api/posts/:id/like
  * @access  Private
  */
-exports.likePost = asyncHandler(async (req, res) => {
-  const post = await Post.findById(req.params.id);
+exports.toggleLike = asyncHandler(async (req, res) => {
+  const isAdmin = req.isAdmin || false;
+  let post = await Post.findById(req.params.id);
+
   if (!post) {
     throw new ErrorResponse('Post not found', 404);
   }
 
-  const likesCount = await post.toggleLike(req.user._id);
+  const likesArray = post.likedBy || post.likes || [];
+  const userLiked = likesArray.some(
+    (like) => like.toString() === req.user._id.toString()
+  );
 
-  // Create notification if post was just liked (not unliked)
-  const wasLiked = post.likes.includes(req.user._id);
-  if (wasLiked && post.author.toString() !== req.user._id.toString()) {
-    await notificationService.createPostLikeNotification(
-      post._id.toString(),
-      req.user._id.toString(),
-      post.author.toString()
-    );
+  if (userLiked) {
+    // Remove like
+    if (post.likedBy) {
+      post.likedBy = post.likedBy.filter(
+        (like) => like.toString() !== req.user._id.toString()
+      );
+    }
+    if (post.likes) {
+      post.likes = post.likes.filter(
+        (like) => like.toString() !== req.user._id.toString()
+      );
+    }
+    if (post.likesCount !== undefined) {
+      post.likesCount = Math.max(0, (post.likesCount || 0) - 1);
+    }
+  } else {
+    // Add like
+    if (post.likedBy) {
+      post.likedBy.push(req.user._id);
+    }
+    if (post.likes) {
+      post.likes.push(req.user._id);
+    }
+    if (post.likesCount !== undefined) {
+      post.likesCount = (post.likesCount || 0) + 1;
+    }
   }
+
+  await post.save(isAdmin ? { validateBeforeSave: false } : {});
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    message: userLiked ? 'Like removed' : 'Post liked',
+    likes: (post.likedBy || post.likes || []).length,
+    likesCount: post.likesCount || (post.likedBy || post.likes || []).length,
+    isLiked: !userLiked
+  });
+});
+
+/**
+ * @desc    Get users who liked a post
+ * @route   GET /api/posts/:id/likes
+ * @access  Public
+ */
+exports.getPostLikes = asyncHandler(async (req, res) => {
+  const post = await Post.findById(req.params.id)
+    .populate('likedBy likes', 'username avatar firstName lastName')
+    .select('likedBy likes likesCount');
+
+  if (!post) {
+    throw new ErrorResponse('Post not found', 404);
+  }
+
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 20;
+  const skip = (page - 1) * limit;
+
+  const likedByArray = post.likedBy || post.likes || [];
+  const likedBy = likedByArray.slice(skip, skip + limit);
+  const total = likedByArray.length;
 
   res.json({
     status: 'success',
-    message: 'Post liked successfully',
+    success: true,
+    results: likedBy.length,
+    pagination: {
+      page,
+      limit,
+      total,
+      pages: Math.ceil(total / limit),
+    },
     data: {
-      likes: likesCount,
+      users: likedBy,
+      likesCount: post.likesCount || total,
     },
   });
 });
 
 /**
- * @desc    Unlike post
- * @route   POST /api/posts/:id/unlike
+ * @desc    Get current user's liked posts
+ * @route   GET /api/posts/liked/me
  * @access  Private
  */
-exports.unlikePost = asyncHandler(async (req, res) => {
+exports.getLikedPosts = asyncHandler(async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const skip = (page - 1) * limit;
+
+  const posts = await Post.find({
+    $or: [
+      { likedBy: req.user._id },
+      { likes: req.user._id }
+    ],
+    status: 'published',
+  })
+    .populate('author', 'username avatar firstName lastName')
+    .populate('category', 'name slug')
+    .populate('tags', 'name slug')
+    .skip(skip)
+    .limit(limit)
+    .sort({ updatedAt: -1 })
+    .lean();
+
+  const total = await Post.countDocuments({
+    $or: [
+      { likedBy: req.user._id },
+      { likes: req.user._id }
+    ],
+    status: 'published',
+  });
+
+  const postsWithLikeStatus = posts.map(post => ({
+    ...post,
+    isLiked: true,
+  }));
+
+  res.json({
+    status: 'success',
+    success: true,
+    results: posts.length,
+    count: posts.length,
+    pagination: {
+      page,
+      limit,
+      total,
+      pages: Math.ceil(total / limit),
+    },
+    data: {
+      posts: postsWithLikeStatus,
+    },
+    posts: postsWithLikeStatus,
+  });
+});
+
+/**
+ * @desc    Track post share
+ * @route   POST /api/posts/:id/share
+ * @access  Public
+ */
+exports.trackShare = asyncHandler(async (req, res) => {
+  const { platform = 'general' } = req.body;
   const post = await Post.findById(req.params.id);
+
   if (!post) {
     throw new ErrorResponse('Post not found', 404);
   }
 
-  const likesCount = await post.toggleLike(req.user._id);
+  const validPlatforms = [
+    'general',
+    'facebook',
+    'twitter',
+    'linkedin',
+    'whatsapp',
+    'telegram',
+    'email',
+    'copy',
+    'native'
+  ];
 
-  res.json({
-    status: 'success',
-    message: 'Post unliked successfully',
-    data: {
-      likes: likesCount,
-    },
-  });
-});
+  const sharePlatform = validPlatforms.includes(platform) ? platform : 'general';
 
-/**
- * @desc    Get featured posts
- * @route   GET /api/posts/featured
- * @access  Public
- */
-exports.getFeaturedPosts = asyncHandler(async (req, res) => {
-  const limit = parseInt(req.query.limit) || 5;
-  const cacheKey = `posts:featured:${limit}`;
-
-  // Try to get from cache
-  let posts = CacheUtil.get(cacheKey);
-
-  if (!posts) {
-    posts = await Post.findPublished({ isFeatured: true })
-      .populate('author', 'username avatar firstName lastName')
-      .populate('category', 'name slug')
-      .populate('tags', 'name slug')
-      .limit(limit)
-      .sort({ publishedAt: -1 })
-      .lean(); // Use lean() for better performance
-
-    // Cache for 10 minutes
-    CacheUtil.set(cacheKey, posts, 600);
-  }
-
-  res.json({
-    status: 'success',
-    results: posts.length,
-    data: {
-      posts,
-    },
-  });
-});
-
-/**
- * @desc    Get posts by category
- * @route   GET /api/posts/category/:categoryId
- * @access  Public
- */
-exports.getPostsByCategory = asyncHandler(async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 10;
-  const skip = (page - 1) * limit;
-
-  const posts = await Post.findPublished({ category: req.params.categoryId })
-    .populate('author', 'username avatar firstName lastName')
-    .populate('category', 'name slug')
-    .populate('tags', 'name slug')
-    .skip(skip)
-    .limit(limit)
-    .sort({ publishedAt: -1 });
-
-  const total = await Post.countDocuments({
-    category: req.params.categoryId,
-    status: 'published',
-    publishedAt: { $lte: new Date() },
-  });
-
-  res.json({
-    status: 'success',
-    results: posts.length,
-    pagination: {
-      page,
-      limit,
-      total,
-      pages: Math.ceil(total / limit),
-    },
-    data: {
-      posts,
-    },
-  });
-});
-
-/**
- * @desc    Get posts by tag
- * @route   GET /api/posts/tag/:tagId
- * @access  Public
- */
-exports.getPostsByTag = asyncHandler(async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 10;
-  const skip = (page - 1) * limit;
-
-  const posts = await Post.findPublished({ tags: req.params.tagId })
-    .populate('author', 'username avatar firstName lastName')
-    .populate('category', 'name slug')
-    .populate('tags', 'name slug')
-    .skip(skip)
-    .limit(limit)
-    .sort({ publishedAt: -1 });
-
-  const total = await Post.countDocuments({
-    tags: req.params.tagId,
-    status: 'published',
-    publishedAt: { $lte: new Date() },
-  });
-
-  res.json({
-    status: 'success',
-    results: posts.length,
-    pagination: {
-      page,
-      limit,
-      total,
-      pages: Math.ceil(total / limit),
-    },
-    data: {
-      posts,
-    },
-  });
-});
-
-/**
- * @desc    Get posts by author
- * @route   GET /api/posts/author/:authorId
- * @access  Public
- */
-exports.getPostsByAuthor = asyncHandler(async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 10;
-  const skip = (page - 1) * limit;
-
-  const posts = await Post.findPublished({ author: req.params.authorId })
-    .populate('author', 'username avatar firstName lastName')
-    .populate('category', 'name slug')
-    .populate('tags', 'name slug')
-    .skip(skip)
-    .limit(limit)
-    .sort({ publishedAt: -1 });
-
-  const total = await Post.countDocuments({
-    author: req.params.authorId,
-    status: 'published',
-    publishedAt: { $lte: new Date() },
-  });
-
-  res.json({
-    status: 'success',
-    results: posts.length,
-    pagination: {
-      page,
-      limit,
-      total,
-      pages: Math.ceil(total / limit),
-    },
-    data: {
-      posts,
-    },
-  });
-});
-
-/**
- * @desc    Search posts
- * @route   GET /api/posts/search
- * @access  Public
- */
-exports.searchPosts = asyncHandler(async (req, res) => {
-  const { q } = req.query;
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 10;
-  const skip = (page - 1) * limit;
-
-  if (!q) {
-    throw new ErrorResponse('Search query is required', 400);
-  }
-
-  const posts = await Post.searchPosts(q)
-    .populate('author', 'username avatar firstName lastName')
-    .populate('category', 'name slug')
-    .populate('tags', 'name slug')
-    .skip(skip)
-    .limit(limit);
-
-  const total = await Post.countDocuments({
-    $text: { $search: q },
-    status: 'published',
-    publishedAt: { $lte: new Date() },
-  });
-
-  res.json({
-    status: 'success',
-    results: posts.length,
-    pagination: {
-      page,
-      limit,
-      total,
-      pages: Math.ceil(total / limit),
-    },
-    data: {
-      posts,
-    },
-  });
-});
-
-/**
- * @desc    Get related posts
- * @route   GET /api/posts/:id/related
- * @access  Public
- */
-exports.getRelatedPosts = asyncHandler(async (req, res) => {
-  const limit = parseInt(req.query.limit) || 5;
-  const cacheKey = `posts:related:${req.params.id}:${limit}`;
-
-  // Try to get from cache
-  let relatedPosts = CacheUtil.get(cacheKey);
-
-  if (!relatedPosts) {
-    const post = await Post.findById(req.params.id);
-    if (!post) {
-      throw new ErrorResponse('Post not found', 404);
+  let result;
+  if (post.trackShare) {
+    result = await post.trackShare(sharePlatform);
+  } else {
+    // Manual tracking if method doesn't exist
+    post.shares = (post.shares || 0) + 1;
+    post.totalShares = (post.totalShares || 0) + 1;
+    
+    if (!post.sharesByPlatform) {
+      post.sharesByPlatform = new Map();
     }
-
-    // Find posts with same category or tags, excluding current post
-    relatedPosts = await Post.findPublished({
-      $or: [{ category: post.category }, { tags: { $in: post.tags } }],
-      _id: { $ne: post._id },
-    })
-      .populate('author', 'username avatar firstName lastName')
-      .populate('category', 'name slug')
-      .populate('tags', 'name slug')
-      .limit(limit)
-      .sort({ publishedAt: -1 });
-
-    // Cache for 15 minutes
-    CacheUtil.set(cacheKey, relatedPosts, 900);
+    const currentCount = post.sharesByPlatform.get(sharePlatform) || 0;
+    post.sharesByPlatform.set(sharePlatform, currentCount + 1);
+    
+    await post.save({ validateBeforeSave: false });
+    result = {
+      shares: post.shares,
+      totalShares: post.totalShares
+    };
   }
 
   res.json({
     status: 'success',
-    results: relatedPosts.length,
+    success: true,
+    message: 'Share tracked successfully',
     data: {
-      posts: relatedPosts,
+      shares: result.shares,
+      totalShares: result.totalShares,
+      platform: sharePlatform
     },
   });
 });
 
 /**
- * @desc    Get popular posts
- * @route   GET /api/posts/popular
+ * @desc    Get share statistics for a post
+ * @route   GET /api/posts/:id/shares
  * @access  Public
  */
-exports.getPopularPosts = asyncHandler(async (req, res) => {
-  const limit = parseInt(req.query.limit) || 10;
-  const cacheKey = `posts:popular:${limit}`;
+exports.getPostShares = asyncHandler(async (req, res) => {
+  const post = await Post.findById(req.params.id).select('shares totalShares sharesByPlatform');
 
-  // Try to get from cache
-  let posts = CacheUtil.get(cacheKey);
+  if (!post) {
+    throw new ErrorResponse('Post not found', 404);
+  }
 
-  if (!posts) {
-    posts = await Post.findPublished({})
-      .populate('author', 'username avatar firstName lastName')
-      .populate('category', 'name slug')
-      .populate('tags', 'name slug')
-      .limit(limit)
-      .sort({ views: -1, likes: -1, publishedAt: -1 });
-
-    // Cache for 10 minutes
-    CacheUtil.set(cacheKey, posts, 600);
+  const sharesByPlatform = {};
+  if (post.sharesByPlatform) {
+    if (post.sharesByPlatform instanceof Map) {
+      post.sharesByPlatform.forEach((value, key) => {
+        sharesByPlatform[key] = value;
+      });
+    } else {
+      Object.assign(sharesByPlatform, post.sharesByPlatform);
+    }
   }
 
   res.json({
     status: 'success',
-    results: posts.length,
+    success: true,
     data: {
-      posts,
+      shares: post.shares || 0,
+      totalShares: post.totalShares || 0,
+      sharesByPlatform
     },
+  });
+});
+
+/**
+ * @desc    Add comment to post
+ * @route   POST /api/posts/:id/comments
+ * @access  Private
+ */
+exports.addComment = asyncHandler(async (req, res) => {
+  const isAdmin = req.isAdmin || false;
+  const errors = postValidator.validateComment(req.body);
+  
+  if (errors) {
+    return res.status(400).json({ success: false, errors });
+  }
+
+  let post = await Post.findById(req.params.id);
+
+  if (!post) {
+    throw new ErrorResponse('Post not found', 404);
+  }
+
+  post.comments.push({
+    user: req.user._id,
+    author: req.user._id,
+    content: req.body.content
+  });
+
+  await post.save(isAdmin ? { validateBeforeSave: false } : {});
+  await post.populate('comments.user comments.author', 'firstName lastName avatar username');
+
+  res.status(201).json({
+    success: true,
+    status: 'success',
+    message: 'Comment added successfully',
+    comments: post.comments,
+    data: { comments: post.comments }
+  });
+});
+
+/**
+ * @desc    Delete comment
+ * @route   DELETE /api/posts/:postId/comments/:commentId
+ * @access  Private
+ */
+exports.deleteComment = asyncHandler(async (req, res) => {
+  const isAdmin = req.isAdmin || false;
+  let post = await Post.findById(req.params.postId);
+
+  if (!post) {
+    throw new ErrorResponse('Post not found', 404);
+  }
+
+  const comment = post.comments.id(req.params.commentId);
+
+  if (!comment) {
+    throw new ErrorResponse('Comment not found', 404);
+  }
+
+  const commentUserId = comment.user || comment.author;
+  if (commentUserId.toString() !== req.user._id.toString() && !isAdmin) {
+    throw new ErrorResponse('Not authorized to delete this comment', 403);
+  }
+
+  post.comments.id(req.params.commentId).deleteOne();
+  await post.save(isAdmin ? { validateBeforeSave: false } : {});
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    message: 'Comment permanently deleted from database'
   });
 });
 
@@ -765,585 +734,267 @@ exports.getTrendingPosts = asyncHandler(async (req, res) => {
   const days = parseInt(req.query.days) || 7;
   const cacheKey = `posts:trending:${limit}:${days}`;
 
-  // Try to get from cache
-  let posts = CacheUtil.get(cacheKey);
+  let posts = CacheUtil ? CacheUtil.get(cacheKey) : null;
 
   if (!posts) {
     const dateThreshold = new Date();
     dateThreshold.setDate(dateThreshold.getDate() - days);
 
-    posts = await Post.findPublished({
-      publishedAt: { $gte: dateThreshold },
-    })
+    const query = {
+      status: 'published',
+      publishedAt: { 
+        $lte: new Date(),
+        $gte: dateThreshold 
+      },
+    };
+
+    posts = await Post.find(query)
       .populate('author', 'username avatar firstName lastName')
       .populate('category', 'name slug')
       .populate('tags', 'name slug')
       .limit(limit)
-      .sort({ views: -1, likes: -1, commentsCount: -1 });
+      .sort({ 
+        engagementScore: -1, 
+        likesCount: -1, 
+        totalShares: -1, 
+        views: -1, 
+        commentsCount: -1 
+      })
+      .lean();
 
-    // Cache for 5 minutes (trending posts change frequently)
-    CacheUtil.set(cacheKey, posts, 300);
+    if (CacheUtil) {
+      CacheUtil.set(cacheKey, posts, 300);
+    }
   }
 
   res.json({
     status: 'success',
+    success: true,
     results: posts.length,
-    data: {
-      posts,
-    },
+    count: posts.length,
+    data: { posts },
+    posts
   });
 });
 
 /**
- * @desc    Get draft posts
- * @route   GET /api/posts/drafts/all
- * @access  Private/Admin
- */
-exports.getDraftPosts = asyncHandler(async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 10;
-  const skip = (page - 1) * limit;
-
-  const query = { status: 'draft' };
-
-  // If not admin, only show own drafts
-  if (req.user.role !== 'admin') {
-    query.author = req.user._id;
-  }
-
-  const posts = await Post.find(query)
-    .populate('author', 'username avatar firstName lastName')
-    .populate('category', 'name slug')
-    .populate('tags', 'name slug')
-    .skip(skip)
-    .limit(limit)
-    .sort({ createdAt: -1 });
-
-  const total = await Post.countDocuments(query);
-
-  res.json({
-    status: 'success',
-    results: posts.length,
-    pagination: {
-      page,
-      limit,
-      total,
-      pages: Math.ceil(total / limit),
-    },
-    data: {
-      posts,
-    },
-  });
-});
-
-/**
- * @desc    Get archived posts
- * @route   GET /api/posts/archived/all
- * @access  Private/Admin
- */
-exports.getArchivedPosts = asyncHandler(async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 10;
-  const skip = (page - 1) * limit;
-
-  const query = { status: 'archived' };
-
-  // If not admin, only show own archived posts
-  if (req.user.role !== 'admin') {
-    query.author = req.user._id;
-  }
-
-  const posts = await Post.find(query)
-    .populate('author', 'username avatar firstName lastName')
-    .populate('category', 'name slug')
-    .populate('tags', 'name slug')
-    .skip(skip)
-    .limit(limit)
-    .sort({ updatedAt: -1 });
-
-  const total = await Post.countDocuments(query);
-
-  res.json({
-    status: 'success',
-    results: posts.length,
-    pagination: {
-      page,
-      limit,
-      total,
-      pages: Math.ceil(total / limit),
-    },
-    data: {
-      posts,
-    },
-  });
-});
-
-/**
- * @desc    Publish post
- * @route   POST /api/posts/:id/publish
- * @access  Private/Author
- */
-exports.publishPost = asyncHandler(async (req, res) => {
-  const post = await Post.findById(req.params.id);
-  if (!post) {
-    throw new ErrorResponse('Post not found', 404);
-  }
-
-  // Check authorization
-  if (post.author.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
-    throw new ErrorResponse('Not authorized to publish this post', 403);
-  }
-
-  post.status = 'published';
-  if (!post.publishedAt) {
-    post.publishedAt = new Date();
-  }
-
-  await post.save();
-
-  // Clear cache
-  CacheUtil.del('posts:featured:*');
-  CacheUtil.del('posts:popular:*');
-  CacheUtil.del('posts:trending:*');
-
-  res.json({
-    status: 'success',
-    message: 'Post published successfully',
-    data: {
-      post,
-    },
-  });
-});
-
-/**
- * @desc    Unpublish post
- * @route   POST /api/posts/:id/unpublish
- * @access  Private/Author
- */
-/**
- * @desc    Get embed code for post
- * @route   GET /api/posts/:id/embed
+ * @desc    Get most liked posts
+ * @route   GET /api/posts/most-liked
  * @access  Public
  */
-exports.getEmbedCode = asyncHandler(async (req, res) => {
-  const post = await Post.findOne({
-    $or: [{ _id: req.params.id }, { slug: req.params.id }],
-    status: 'published',
-  })
-    .populate('author', 'username avatar firstName lastName')
-    .populate('category', 'name slug')
-    .lean();
+exports.getMostLiked = asyncHandler(async (req, res) => {
+  const limit = parseInt(req.query.limit) || 10;
+  const cacheKey = `posts:most-liked:${limit}`;
 
-  if (!post) {
-    throw new ErrorResponse('Post not found', 404);
+  let posts = CacheUtil ? CacheUtil.get(cacheKey) : null;
+
+  if (!posts) {
+    posts = await Post.find({
+      status: 'published',
+      publishedAt: { $lte: new Date() },
+    })
+      .populate('author', 'username avatar firstName lastName')
+      .populate('category', 'name slug')
+      .populate('tags', 'name slug')
+      .sort({ likesCount: -1, publishedAt: -1 })
+      .limit(limit)
+      .lean();
+
+    if (CacheUtil) {
+      CacheUtil.set(cacheKey, posts, 600);
+    }
   }
-
-  const baseUrl = process.env.FRONTEND_URL || req.protocol + '://' + req.get('host');
-  const embedUrl = `${baseUrl}/post/${post.slug}`;
-  const width = req.query.width || '600';
-  const height = req.query.height || '400';
-
-  const embedCode = `<iframe src="${embedUrl}/embed" width="${width}" height="${height}" frameborder="0" allowfullscreen></iframe>`;
-  const oEmbedUrl = `${baseUrl}/api/posts/${post._id}/oembed?url=${encodeURIComponent(embedUrl)}`;
 
   res.json({
     status: 'success',
-    data: {
-      embedCode,
-      oEmbedUrl,
-      embedUrl: `${embedUrl}/embed`,
-      post: {
-        title: post.title,
-        excerpt: post.excerpt,
-        author: post.author,
-        category: post.category,
-        featuredImage: post.featuredImage,
-      },
-    },
+    success: true,
+    results: posts.length,
+    count: posts.length,
+    data: { posts },
+    posts
   });
 });
 
 /**
- * @desc    Get oEmbed data for post
- * @route   GET /api/posts/:id/oembed
+ * @desc    Get most shared posts
+ * @route   GET /api/posts/most-shared
  * @access  Public
  */
-exports.getOEmbed = asyncHandler(async (req, res) => {
-  const post = await Post.findOne({
-    $or: [{ _id: req.params.id }, { slug: req.params.id }],
+exports.getMostShared = asyncHandler(async (req, res) => {
+  const limit = parseInt(req.query.limit) || 10;
+  const cacheKey = `posts:most-shared:${limit}`;
+
+  let posts = CacheUtil ? CacheUtil.get(cacheKey) : null;
+
+  if (!posts) {
+    posts = await Post.find({
+      status: 'published',
+      publishedAt: { $lte: new Date() },
+    })
+      .populate('author', 'username avatar firstName lastName')
+      .populate('category', 'name slug')
+      .populate('tags', 'name slug')
+      .sort({ totalShares: -1, publishedAt: -1 })
+      .limit(limit)
+      .lean();
+
+    if (CacheUtil) {
+      CacheUtil.set(cacheKey, posts, 600);
+    }
+  }
+
+  res.json({
+    status: 'success',
+    success: true,
+    results: posts.length,
+    count: posts.length,
+    data: { posts },
+    posts
+  });
+});
+
+/**
+ * @desc    Get featured posts
+ * @route   GET /api/posts/featured
+ * @access  Public
+ */
+exports.getFeaturedPosts = asyncHandler(async (req, res) => {
+  const limit = parseInt(req.query.limit) || 5;
+
+  const posts = await Post.find({ 
+    isFeatured: true, 
     status: 'published',
+    publishedAt: { $lte: new Date() }
   })
-    .populate('author', 'username avatar firstName lastName')
+    .populate('author', 'firstName lastName avatar username')
+    .populate('category', 'name slug')
+    .populate('tags', 'name slug')
+    .limit(limit)
+    .sort({ publishedAt: -1 })
     .lean();
 
-  if (!post) {
-    throw new ErrorResponse('Post not found', 404);
-  }
-
-  const baseUrl = process.env.FRONTEND_URL || req.protocol + '://' + req.get('host');
-  const url = req.query.url || `${baseUrl}/post/${post.slug}`;
-  const maxWidth = req.query.maxwidth || 600;
-  const maxHeight = req.query.maxheight || 400;
-
-  const authorName = post.author
-    ? `${post.author.firstName || ''} ${post.author.lastName || ''}`.trim() || post.author.username
-    : 'Unknown';
-
-  res.json({
-    type: 'rich',
-    version: '1.0',
-    title: post.title,
-    author_name: authorName,
-    author_url: `${baseUrl}/author/${post.author?.username || ''}`,
-    provider_name: 'Gidix',
-    provider_url: baseUrl,
-    cache_age: 3600,
-    html: `<iframe src="${url}/embed" width="${maxWidth}" height="${maxHeight}" frameborder="0" allowfullscreen></iframe>`,
-    width: maxWidth,
-    height: maxHeight,
-    thumbnail_url: post.featuredImage || null,
-    thumbnail_width: post.featuredImage ? 600 : null,
-    thumbnail_height: post.featuredImage ? 400 : null,
-  });
-});
-
-exports.unpublishPost = asyncHandler(async (req, res) => {
-  const post = await Post.findById(req.params.id);
-  if (!post) {
-    throw new ErrorResponse('Post not found', 404);
-  }
-
-  // Check authorization
-  if (post.author.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
-    throw new ErrorResponse('Not authorized to unpublish this post', 403);
-  }
-
-  post.status = 'draft';
-
-  await post.save();
-
-  // Clear cache
-  CacheUtil.del('posts:featured:*');
-  CacheUtil.del('posts:popular:*');
-  CacheUtil.del('posts:trending:*');
-
-  res.json({
+  res.status(200).json({
+    success: true,
     status: 'success',
-    message: 'Post unpublished successfully',
-    data: {
-      post,
-    },
+    count: posts.length,
+    results: posts.length,
+    posts,
+    data: { posts }
   });
 });
 
 /**
- * @desc    Archive post
- * @route   POST /api/posts/:id/archive
- * @access  Private/Author
+ * @desc    Toggle featured status (admin only)
+ * @route   PUT /api/posts/:id/featured
+ * @access  Private/Admin
  */
-exports.archivePost = asyncHandler(async (req, res) => {
-  const post = await Post.findById(req.params.id);
-  if (!post) {
-    throw new ErrorResponse('Post not found', 404);
-  }
-
-  // Check authorization
-  if (post.author.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
-    throw new ErrorResponse('Not authorized to archive this post', 403);
-  }
-
-  post.status = 'archived';
-
-  await post.save();
-
-  // Clear cache
-  CacheUtil.del('posts:featured:*');
-  CacheUtil.del('posts:popular:*');
-
-  res.json({
-    status: 'success',
-    message: 'Post archived successfully',
-    data: {
-      post,
-    },
-  });
-});
-
-/**
- * @desc    Duplicate post
- * @route   POST /api/posts/:id/duplicate
- * @access  Private/Author
- */
-exports.duplicatePost = asyncHandler(async (req, res) => {
-  const originalPost = await Post.findById(req.params.id);
-  if (!originalPost) {
-    throw new ErrorResponse('Post not found', 404);
-  }
-
-  // Check authorization
-  if (originalPost.author.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
-    throw new ErrorResponse('Not authorized to duplicate this post', 403);
-  }
-
-  // Create duplicate post
-  const duplicateTitle = `${originalPost.title} (Copy)`;
-  let baseSlug = duplicateTitle
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  
-  // Ensure slug is unique
-  const slug = await generateUniqueSlug(baseSlug);
-
-  const duplicate = await Post.create({
-    title: duplicateTitle,
-    slug,
-    excerpt: originalPost.excerpt,
-    content: originalPost.content,
-    category: originalPost.category,
-    tags: originalPost.tags,
-    author: req.user._id,
-    status: 'draft',
-    featuredImage: originalPost.featuredImage,
-    seoTitle: originalPost.seoTitle,
-    seoDescription: originalPost.seoDescription,
-    seoKeywords: originalPost.seoKeywords,
-    isFeatured: false,
-    allowComments: originalPost.allowComments,
-  });
-
-  const populatedPost = await Post.findById(duplicate._id)
-    .populate('author', 'username avatar firstName lastName')
-    .populate('category', 'name slug')
-    .populate('tags', 'name slug');
-
-  res.status(201).json({
-    status: 'success',
-    message: 'Post duplicated successfully',
-    data: {
-      post: populatedPost,
-    },
-  });
-});
-
-/**
- * @desc    Export post
- * @route   GET /api/posts/:id/export
- * @access  Private/Author
- */
-exports.exportPost = asyncHandler(async (req, res) => {
-  const post = await Post.findById(req.params.id)
-    .populate('author', 'username email')
-    .populate('category', 'name slug')
-    .populate('tags', 'name slug');
+exports.toggleFeatured = asyncHandler(async (req, res) => {
+  let post = await Post.findById(req.params.id);
 
   if (!post) {
     throw new ErrorResponse('Post not found', 404);
   }
 
-  // Check authorization
-  if (post.author._id.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
-    throw new ErrorResponse('Not authorized to export this post', 403);
-  }
+  post.isFeatured = !post.isFeatured;
+  await post.save({ validateBeforeSave: false });
 
-  // Export as JSON
-  const exportData = {
-    title: post.title,
-    slug: post.slug,
-    excerpt: post.excerpt,
-    content: post.content,
-    category: post.category.name,
-    tags: post.tags.map((tag) => tag.name),
-    status: post.status,
-    featuredImage: post.featuredImage,
-    seoTitle: post.seoTitle,
-    seoDescription: post.seoDescription,
-    seoKeywords: post.seoKeywords,
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    message: `Post ${post.isFeatured ? 'featured' : 'unfeatured'} successfully`,
     isFeatured: post.isFeatured,
-    allowComments: post.allowComments,
-    publishedAt: post.publishedAt,
-    createdAt: post.createdAt,
-    updatedAt: post.updatedAt,
-    exportedAt: new Date().toISOString(),
+    post
+  });
+});
+
+/**
+ * @desc    Get posts by author
+ * @route   GET /api/posts/author/:authorId
+ * @access  Public
+ */
+exports.getPostsByAuthor = asyncHandler(async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const skip = (page - 1) * limit;
+
+  const query = { 
+    author: req.params.authorId, 
+    status: 'published',
+    publishedAt: { $lte: new Date() }
   };
 
-  res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Content-Disposition', `attachment; filename="${post.slug}-export.json"`);
-  res.json(exportData);
-});
-
-/**
- * @desc    Import post
- * @route   POST /api/posts/import
- * @access  Private/Author
- */
-exports.importPost = asyncHandler(async (req, res) => {
-  if (!req.file) {
-    throw new ErrorResponse('Import file is required', 400);
-  }
-
-  // Parse JSON file
-  const fs = require('fs');
-  const importData = JSON.parse(fs.readFileSync(req.file.path, 'utf8'));
-
-  // Find or create category
-  let category = await Category.findOne({ name: importData.category });
-  if (!category) {
-    category = await Category.create({
-      name: importData.category,
-      description: `Imported category: ${importData.category}`,
-    });
-  }
-
-  // Process tags
-  let tagIds = [];
-  if (importData.tags && Array.isArray(importData.tags)) {
-    for (const tagName of importData.tags) {
-      let tag = await Tag.findOne({ name: tagName.toLowerCase() });
-      if (!tag) {
-        tag = await Tag.create({ name: tagName.toLowerCase() });
-      }
-      tagIds.push(tag._id);
-    }
-  }
-
-  // Create post
-  const importTitle = importData.title || 'Imported Post';
-  let baseSlug = importTitle
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  
-  // Ensure slug is unique
-  const importSlug = await generateUniqueSlug(baseSlug);
-
-  const post = await Post.create({
-    title: importTitle,
-    slug: importSlug,
-    excerpt: importData.excerpt || '',
-    content: importData.content || '',
-    category: category._id,
-    tags: tagIds,
-    author: req.user._id,
-    status: importData.status || 'draft',
-    featuredImage: importData.featuredImage,
-    seoTitle: importData.seoTitle,
-    seoDescription: importData.seoDescription,
-    seoKeywords: importData.seoKeywords || [],
-    isFeatured: importData.isFeatured || false,
-    allowComments: importData.allowComments !== undefined ? importData.allowComments : true,
-    publishedAt: importData.publishedAt ? new Date(importData.publishedAt) : null,
-  });
-
-  // Clean up uploaded file
-  fs.unlinkSync(req.file.path);
-
-  const populatedPost = await Post.findById(post._id)
-    .populate('author', 'username avatar firstName lastName')
+  const posts = await Post.find(query)
+    .populate('author', 'firstName lastName avatar username')
     .populate('category', 'name slug')
-    .populate('tags', 'name slug');
+    .populate('tags', 'name slug')
+    .skip(skip)
+    .limit(limit)
+    .sort({ publishedAt: -1 })
+    .lean();
 
-  res.status(201).json({
+  const total = await Post.countDocuments(query);
+
+  res.status(200).json({
+    success: true,
     status: 'success',
-    message: 'Post imported successfully',
-    data: {
-      post: populatedPost,
+    count: posts.length,
+    results: posts.length,
+    total,
+    pages: Math.ceil(total / limit),
+    pagination: {
+      page,
+      limit,
+      total,
+      pages: Math.ceil(total / limit),
     },
+    posts,
+    data: { posts }
   });
 });
 
 /**
- * @desc    Bulk delete posts
- * @route   POST /api/posts/bulk/delete
- * @access  Private/Admin
+ * @desc    Get posts by category
+ * @route   GET /api/posts/category/:category
+ * @access  Public
  */
-exports.bulkDeletePosts = asyncHandler(async (req, res) => {
-  const { postIds } = req.body;
+exports.getPostsByCategory = asyncHandler(async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const skip = (page - 1) * limit;
 
-  if (!Array.isArray(postIds) || postIds.length === 0) {
-    throw new ErrorResponse('Post IDs array is required', 400);
-  }
+  const query = {
+    category: req.params.category,
+    status: 'published',
+    publishedAt: { $lte: new Date() }
+  };
 
-  // If not admin, only allow deleting own posts
-  const query = { _id: { $in: postIds } };
-  if (req.user.role !== 'admin') {
-    query.author = req.user._id;
-  }
+  const posts = await Post.find(query)
+    .populate('author', 'firstName lastName avatar username')
+    .populate('category', 'name slug')
+    .populate('tags', 'name slug')
+    .limit(limit)
+    .skip(skip)
+    .sort({ publishedAt: -1 })
+    .lean();
 
-  const posts = await Post.find(query);
+  const total = await Post.countDocuments(query);
 
-  // Decrement tag usage for all posts
-  for (const post of posts) {
-    for (const tagId of post.tags) {
-      const tag = await Tag.findById(tagId);
-      if (tag) {
-        await tag.decrementUsage();
-      }
-    }
-  }
-
-  const result = await Post.deleteMany(query);
-
-  // Clear cache
-  CacheUtil.del('posts:featured:*');
-  CacheUtil.del('posts:popular:*');
-
-  res.json({
+  res.status(200).json({
+    success: true,
     status: 'success',
-    message: `${result.deletedCount} post(s) deleted successfully`,
-    data: {
-      deletedCount: result.deletedCount,
+    count: posts.length,
+    results: posts.length,
+    total,
+    pages: Math.ceil(total / limit),
+    pagination: {
+      page,
+      limit,
+      total,
+      pages: Math.ceil(total / limit),
     },
+    posts,
+    data: { posts }
   });
 });
 
-/**
- * @desc    Bulk update posts
- * @route   POST /api/posts/bulk/update
- * @access  Private/Admin
- */
-exports.bulkUpdatePosts = asyncHandler(async (req, res) => {
-  const { postIds, updates } = req.body;
-
-  if (!Array.isArray(postIds) || postIds.length === 0) {
-    throw new ErrorResponse('Post IDs array is required', 400);
-  }
-
-  if (!updates || typeof updates !== 'object') {
-    throw new ErrorResponse('Updates object is required', 400);
-  }
-
-  // If not admin, only allow updating own posts
-  const query = { _id: { $in: postIds } };
-  if (req.user.role !== 'admin') {
-    query.author = req.user._id;
-  }
-
-  // Remove fields that shouldn't be bulk updated
-  const allowedFields = ['status', 'isFeatured', 'allowComments', 'category'];
-  const filteredUpdates = {};
-  allowedFields.forEach((field) => {
-    if (updates[field] !== undefined) {
-      filteredUpdates[field] = updates[field];
-    }
-  });
-
-  if (Object.keys(filteredUpdates).length === 0) {
-    throw new ErrorResponse('No valid update fields provided', 400);
-  }
-
-  const result = await Post.updateMany(query, { $set: filteredUpdates });
-
-  // Clear cache
-  CacheUtil.del('posts:featured:*');
-  CacheUtil.del('posts:popular:*');
-
-  res.json({
-    status: 'success',
-    message: `${result.modifiedCount} post(s) updated successfully`,
-    data: {
-      modifiedCount: result.modifiedCount,
-    },
-  });
-});
-
+module.exports = exports;

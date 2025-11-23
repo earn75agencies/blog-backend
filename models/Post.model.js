@@ -1,8 +1,10 @@
 const mongoose = require('mongoose');
 
 /**
- * Optimized Post Schema - Reduced indexes for better write performance
+ * Optimized Post Schema with Like & Share functionality
+ * Maintains all existing features while adding social interactions
  */
+//start schema definition
 const postSchema = new mongoose.Schema(
   {
     title: {
@@ -65,10 +67,17 @@ const postSchema = new mongoose.Schema(
       type: Number,
       default: 0,
     },
-    likesCount: {  // CHANGED: Store count instead of array for better performance
+    // ===== UPDATED: Enhanced likes system for better performance =====
+    likesCount: {
       type: Number,
       default: 0,
+      index: true,  // Added index for sorting by popularity
     },
+    // NEW: Track who liked for user-specific queries (separate collection recommended for scale)
+    likedBy: [{
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    }],
     readingTime: {
       type: Number,
       default: 0,
@@ -202,9 +211,23 @@ const postSchema = new mongoose.Schema(
       default: 0,
       index: true,
     },
+    // ===== NEW: Enhanced shares tracking =====
     shares: {
       type: Number,
       default: 0,
+      index: true,  // Added index for analytics
+    },
+    // NEW: Detailed share tracking by platform
+    sharesByPlatform: {
+      type: Map,
+      of: Number,
+      default: new Map(),
+    },
+    // NEW: Total share count including all platforms
+    totalShares: {
+      type: Number,
+      default: 0,
+      index: true,
     },
     rankingScore: {
       type: Number,
@@ -226,6 +249,48 @@ const postSchema = new mongoose.Schema(
         ref: 'Category',
       },
     ],
+    // ============================================
+// ADD THESE FIELDS TO YOUR POST SCHEMA
+// ============================================
+
+// Add these fields to your existing postSchema definition:
+
+podcastUrl: {
+  type: String,
+  default: null,
+},
+podcastDuration: {
+  type: Number,
+  default: 0,
+},
+viralityPrediction: {
+  score: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100,
+  },
+  factors: [String],
+  lastUpdated: Date,
+},
+sentimentAnalysis: {
+  score: Number,
+  sentiment: {
+    type: String,
+    enum: ['positive', 'neutral', 'negative'],
+  },
+  emotions: [String],
+  toxicity: Number,
+  analyzedAt: Date,
+},
+seoOptimized: {
+  type: Boolean,
+  default: false,
+},
+isIndexedInPinecone: {
+  type: Boolean,
+  default: false,
+},
   },
   {
     timestamps: true,
@@ -233,8 +298,9 @@ const postSchema = new mongoose.Schema(
     toObject: { virtuals: true },
   }
 );
+//end schema definition
 
-// ===== CRITICAL INDEXES ONLY (Reduced from 26+ to 10) =====
+// ===== CRITICAL INDEXES (Maintained + Enhanced) =====
 
 // 1. Unique slug for lookups
 postSchema.index({ slug: 1 }, { unique: true });
@@ -254,7 +320,7 @@ postSchema.index({ isFeatured: 1, status: 1, publishedAt: -1 });
 // 6. Trending/popular (ranking-based)
 postSchema.index({ status: 1, rankingScore: -1, publishedAt: -1 });
 
-// 7. Tag filtering (keep if heavily used)
+// 7. Tag filtering
 postSchema.index({ tags: 1, status: 1, publishedAt: -1 });
 
 // 8. Most viewed posts
@@ -263,26 +329,23 @@ postSchema.index({ status: 1, views: -1 });
 // 9. Cursor pagination
 postSchema.index({ cursor: 1 });
 
-// 10. Full-text search (ONLY ONE - REMOVED DUPLICATE!)
+// 10. Full-text search
 postSchema.index({ title: 'text', content: 'text', excerpt: 'text' });
 
-// REMOVED INDEXES (move these queries to application layer or use less frequently):
-// - contentType compound index (query in memory if needed)
-// - isPaid compound index (filter in application)
-// - hasVRContent, isCollaborative (low cardinality, poor index performance)
-// - viralityScore, accessibilityScore (not frequently queried)
-// - expiresAt (use TTL index if needed or background job)
-// - targetRegions (array index, expensive)
-// - likes array index (replaced with likesCount)
+// 11. NEW: Most liked posts (for trending/popular)
+postSchema.index({ status: 1, likesCount: -1, publishedAt: -1 });
 
-// Virtual for comments (only populate when explicitly needed)
+// 12. NEW: Most shared posts (for viral content)
+postSchema.index({ status: 1, totalShares: -1, publishedAt: -1 });
+
+// Virtual for comments
 postSchema.virtual('comments', {
   ref: 'Comment',
   localField: '_id',
   foreignField: 'post',
 });
 
-// Pre-save middleware (lightweight operations only)
+// ===== PRE-SAVE MIDDLEWARE =====
 postSchema.pre('save', function (next) {
   // Generate slug
   if (this.isModified('title') && !this.slug) {
@@ -309,28 +372,127 @@ postSchema.pre('save', function (next) {
     this.publishedAt = new Date();
   }
 
+  // NEW: Sync totalShares with shares
+  if (this.isModified('shares') || this.isModified('sharesByPlatform')) {
+    let platformSharesSum = 0;
+    if (this.sharesByPlatform && this.sharesByPlatform.size > 0) {
+      this.sharesByPlatform.forEach(count => {
+        platformSharesSum += count;
+      });
+    }
+    this.totalShares = this.shares + platformSharesSum;
+  }
+
   next();
 });
 
-// REMOVED: Blocking post-save hook for ranking score
-// Instead, update ranking scores via:
-// 1. Background job (every 15-30 minutes)
-// 2. Queue system (Bull/BullMQ)
-// 3. Only when engagement metrics change significantly
+// ===== INSTANCE METHODS =====
 
 // Method to increment views (optimized)
 postSchema.methods.incrementViews = async function () {
-  // Use atomic update instead of save
   await mongoose.model('Post').updateOne(
     { _id: this._id },
     { $inc: { views: 1 } }
   );
 };
 
-// Method to toggle like (optimized with separate PostLike collection recommended)
+// NEW: Method to like a post
+postSchema.methods.likePost = async function (userId) {
+  // Check if user already liked
+  const alreadyLiked = this.likedBy.some(id => id.toString() === userId.toString());
+  
+  if (alreadyLiked) {
+    throw new Error('Post already liked by this user');
+  }
+
+  // Add user to likedBy array and increment count
+  await mongoose.model('Post').updateOne(
+    { _id: this._id },
+    { 
+      $addToSet: { likedBy: userId },
+      $inc: { likesCount: 1 }
+    }
+  );
+
+  this.likedBy.push(userId);
+  this.likesCount += 1;
+
+  return {
+    likesCount: this.likesCount,
+    isLiked: true
+  };
+};
+
+// NEW: Method to unlike a post
+postSchema.methods.unlikePost = async function (userId) {
+  // Check if user has liked the post
+  const hasLiked = this.likedBy.some(id => id.toString() === userId.toString());
+  
+  if (!hasLiked) {
+    throw new Error('Post not liked by this user');
+  }
+
+  // Remove user from likedBy array and decrement count
+  await mongoose.model('Post').updateOne(
+    { _id: this._id },
+    { 
+      $pull: { likedBy: userId },
+      $inc: { likesCount: -1 }
+    }
+  );
+
+  this.likedBy = this.likedBy.filter(id => id.toString() !== userId.toString());
+  this.likesCount = Math.max(0, this.likesCount - 1);
+
+  return {
+    likesCount: this.likesCount,
+    isLiked: false
+  };
+};
+
+// NEW: Method to check if user has liked the post
+postSchema.methods.isLikedBy = function (userId) {
+  if (!userId) return false;
+  return this.likedBy.some(id => id.toString() === userId.toString());
+};
+
+// NEW: Method to track share
+postSchema.methods.trackShare = async function (platform = 'general') {
+  const update = {
+    $inc: { 
+      shares: 1,
+      totalShares: 1
+    }
+  };
+
+  // Track by platform if specified
+  if (platform && platform !== 'general') {
+    const platformKey = `sharesByPlatform.${platform}`;
+    update.$inc[platformKey] = 1;
+  }
+
+  await mongoose.model('Post').updateOne(
+    { _id: this._id },
+    update
+  );
+
+  this.shares += 1;
+  this.totalShares += 1;
+
+  if (platform && platform !== 'general') {
+    const currentCount = this.sharesByPlatform.get(platform) || 0;
+    this.sharesByPlatform.set(platform, currentCount + 1);
+  }
+
+  return {
+    shares: this.shares,
+    totalShares: this.totalShares
+  };
+};
+
+// Original toggleLike method (kept for backward compatibility)
 postSchema.methods.toggleLike = async function (userId) {
-  // Instead of storing array, increment/decrement counter
-  // You should create a separate PostLike collection for scalability
+  // For better performance, create a separate PostLike collection
   const Like = mongoose.model('PostLike');
   const existingLike = await Like.findOne({ post: this._id, user: userId });
   
@@ -338,20 +500,27 @@ postSchema.methods.toggleLike = async function (userId) {
     await existingLike.deleteOne();
     await mongoose.model('Post').updateOne(
       { _id: this._id },
-      { $inc: { likesCount: -1 } }
+      { 
+        $pull: { likedBy: userId },
+        $inc: { likesCount: -1 }
+      }
     );
     return this.likesCount - 1;
   } else {
     await Like.create({ post: this._id, user: userId });
     await mongoose.model('Post').updateOne(
       { _id: this._id },
-      { $inc: { likesCount: 1 } }
+      { 
+        $addToSet: { likedBy: userId },
+        $inc: { likesCount: 1 }
+      }
     );
     return this.likesCount + 1;
   }
 };
 
-// Static methods
+// ===== STATIC METHODS =====
+
 postSchema.statics.findPublished = function (query = {}) {
   return this.find({
     ...query,
@@ -388,6 +557,116 @@ postSchema.statics.paginateWithCursor = function (query = {}, options = {}) {
     .lean();
 };
 
+// NEW: Get most liked posts
+postSchema.statics.getMostLiked = function (limit = 10) {
+  return this.find({
+    status: 'published',
+    publishedAt: { $lte: new Date() },
+  })
+    .sort({ likesCount: -1, publishedAt: -1 })
+    .limit(limit)
+    .populate('author', 'name username avatar')
+    .populate('category', 'name slug')
+    .lean();
+};
+
+// NEW: Get most shared posts
+postSchema.statics.getMostShared = function (limit = 10) {
+  return this.find({
+    status: 'published',
+    publishedAt: { $lte: new Date() },
+  })
+    .sort({ totalShares: -1, publishedAt: -1 })
+    .limit(limit)
+    .populate('author', 'name username avatar')
+    .populate('category', 'name slug')
+    .lean();
+};
+
+// NEW: Get trending posts (combination of likes, shares, views)
+postSchema.statics.getTrending = function (limit = 10, days = 7) {
+  const dateThreshold = new Date();
+  dateThreshold.setDate(dateThreshold.getDate() - days);
+
+  return this.find({
+    status: 'published',
+    publishedAt: { 
+      $lte: new Date(),
+      $gte: dateThreshold 
+    },
+  })
+    .sort({ engagementScore: -1, likesCount: -1, totalShares: -1 })
+    .limit(limit)
+    .populate('author', 'name username avatar')
+    .populate('category', 'name slug')
+    .lean();
+};
+// ============================================
+// ADD THESE HOOKS AT THE END OF YOUR FILE
+// (After all other pre/post hooks, before module.exports)
+// ============================================
+
+// Auto-index published posts to Pinecone
+postSchema.post('save', async function(doc) {
+  // Only index published posts
+  if (doc.status === 'published' && !doc.isIndexedInPinecone) {
+    try {
+      const pineconeService = require('../services/ai/pinecone.service');
+      
+      if (pineconeService.isAvailable()) {
+        // Populate required fields for indexing
+        await doc.populate('category', 'name');
+        await doc.populate('tags', 'name');
+        await doc.populate('author', 'username');
+        
+        await pineconeService.upsertPost(doc);
+        
+        // Mark as indexed
+        doc.isIndexedInPinecone = true;
+        await doc.save();
+        
+        console.log(`✅ Post ${doc._id} indexed in Pinecone`);
+      }
+    } catch (error) {
+      console.error(`❌ Failed to index post ${doc._id}:`, error.message);
+      // Don't throw - indexing failure shouldn't break post creation
+    }
+  }
+});
+
+// Remove from Pinecone when post is deleted
+postSchema.post('remove', async function(doc) {
+  try {
+    const pineconeService = require('../services/ai/pinecone.service');
+    
+    if (pineconeService.isAvailable()) {
+      await pineconeService.deletePost(doc._id);
+      console.log(`✅ Post ${doc._id} removed from Pinecone`);
+    }
+  } catch (error) {
+    console.error(`❌ Failed to remove post ${doc._id} from Pinecone:`, error.message);
+  }
+});
+
+// Update Pinecone when post is updated
+postSchema.post('findOneAndUpdate', async function(doc) {
+  if (doc && doc.status === 'published') {
+    try {
+      const pineconeService = require('../services/ai/pinecone.service');
+      
+      if (pineconeService.isAvailable()) {
+        await doc.populate('category', 'name');
+        await doc.populate('tags', 'name');
+        await doc.populate('author', 'username');
+        
+        await pineconeService.upsertPost(doc);
+        console.log(`✅ Post ${doc._id} updated in Pinecone`);
+      }
+    } catch (error) {
+      console.error(`❌ Failed to update post ${doc._id} in Pinecone:`, error.message);
+    }
+  }
+});
 const Post = mongoose.model('Post', postSchema);
 
 module.exports = Post;

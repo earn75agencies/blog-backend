@@ -1,28 +1,72 @@
+/**
+ * AI Routes - Complete with Real AI Services
+ */
+
 const express = require('express');
 const {
+  semanticSearch,
+  getPostRecommendations,
   getContentSuggestions,
-  getRecommendations,
-  autoTag,
+  optimizeSEO,
   analyzeSentiment,
-  generateSEO,
   moderateContent,
+  predictVirality,
+  generatePodcast,
+  autoTag,
+  getRecommendations,
   getPersonalizedDashboard,
+  reindexPosts,
+  getServiceStatus,
 } = require('../controllers/ai.controller');
-const { authenticate, authorize } = require('../middleware/auth.middleware');
+const { authenticate, authorize, optionalAuth } = require('../middleware/auth.middleware');
 
 const router = express.Router();
 
-// All routes require authentication
-router.use(authenticate);
+// ===== PUBLIC/OPTIONAL AUTH ROUTES =====
 
-// AI Features
-router.get('/suggestions', authorize('author', 'admin'), getContentSuggestions);
-router.get('/recommendations', getRecommendations);
-router.post('/auto-tag', authorize('author', 'admin'), autoTag);
-router.post('/sentiment', analyzeSentiment);
-router.post('/seo', authorize('author', 'admin'), generateSEO);
-router.post('/moderate', authorize('admin'), moderateContent);
-router.get('/dashboard', getPersonalizedDashboard);
+// Semantic search - available to all (with optional auth for personalization)
+router.get('/search', optionalAuth, semanticSearch);
+
+// Post recommendations - public
+router.get('/recommendations/post/:postId', optionalAuth, getPostRecommendations);
+
+// ===== PROTECTED ROUTES - ALL AUTHENTICATED USERS =====
+
+// User personalized recommendations
+router.get('/recommendations', authenticate, getRecommendations);
+
+// Personalized dashboard
+router.get('/dashboard', authenticate, getPersonalizedDashboard);
+
+// Sentiment analysis
+router.post('/sentiment', authenticate, analyzeSentiment);
+
+// ===== PROTECTED ROUTES - AUTHORS & ADMINS =====
+
+// Content suggestions
+router.post('/suggestions', authenticate, authorize('author', 'admin'), getContentSuggestions);
+
+// SEO optimization
+router.post('/seo/optimize', authenticate, authorize('author', 'admin'), optimizeSEO);
+
+// Auto-tag content
+router.post('/auto-tag', authenticate, authorize('author', 'admin'), autoTag);
+
+// Virality prediction
+router.post('/virality/:postId', authenticate, authorize('author', 'admin'), predictVirality);
+
+// Podcast generation
+router.post('/podcast/:postId', authenticate, authorize('author', 'admin'), generatePodcast);
+
+// ===== PROTECTED ROUTES - ADMIN ONLY =====
+
+// Content moderation
+router.post('/moderate', authenticate, authorize('admin'), moderateContent);
+
+// Reindex all posts
+router.post('/reindex', authenticate, authorize('admin'), reindexPosts);
+
+// Service status
+router.get('/status', authenticate, authorize('admin'), getServiceStatus);
 
 module.exports = router;
-
