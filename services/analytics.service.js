@@ -4,6 +4,10 @@ const Comment = require('../models/Comment.model');
 const Category = require('../models/Category.model');
 const Tag = require('../models/Tag.model');
 const View = require('../models/View.model');
+const AnalyticsEvent = require('../models/AnalyticsEvent.model');
+const { cacheService } = require('./cache.service');
+const geoip = require('geoip-lite');
+const UAParser = require('ua-parser-js');
 
 /**
  * Analytics service

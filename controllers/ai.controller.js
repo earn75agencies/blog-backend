@@ -10,6 +10,7 @@ const User = require('../models/User.model');
 const openaiService = require('../services/ai/openai.service');
 const pineconeService = require('../services/ai/pinecone.service');
 const elevenlabsService = require('../services/ai/elevenlabs.service');
+const Bookmark = require('../models/Bookmark.model');
 
 /**
  * @desc    Semantic search posts
@@ -337,9 +338,8 @@ exports.autoTag = asyncHandler(async (req, res) => {
 exports.getRecommendations = asyncHandler(async (req, res) => {
   const { limit = 10 } = req.query;
 
-  // Get user's reading history
-  const userBookmarks = await require('../models/Bookmark.model')
-    .find({ user: req.user._id })
+// Get user's reading history
+  const userBookmarks = await Bookmark.find({ user: req.user._id })
     .populate({
       path: 'post',
       populate: [
@@ -428,8 +428,7 @@ exports.getPersonalizedDashboard = asyncHandler(async (req, res) => {
     .limit(50)
     .lean();
 
-  const userBookmarks = await require('../models/Bookmark.model')
-    .find({ user: req.user._id })
+const userBookmarks = await Bookmark.find({ user: req.user._id })
     .populate({
       path: 'post',
       populate: [

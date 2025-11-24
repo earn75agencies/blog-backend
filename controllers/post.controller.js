@@ -1,8 +1,9 @@
-const Post = require('../models/Post');
-const postValidator = require('../validators/postValidator');
+const Post = require('../models/Post.model');
+const { createPostValidation, updatePostValidation } = require('../validators/post.validator');
 const { asyncHandler, APIError } = require('../middleware/errorMiddleware');
-const ErrorResponse = require('../utils/errorResponse');
-const CacheUtil = require('../utils/cacheUtil');
+const ErrorResponse = require('../utils/ErrorResponse');
+const CacheUtil = require('../utils/cache.util');
+const { validationResult } = require('express-validator');
 
 /**
  * @desc    Get all posts with filtering and pagination (supports both cursor and offset)
@@ -259,10 +260,13 @@ exports.getPostBySlug = exports.getPost;
 exports.createPost = asyncHandler(async (req, res) => {
   const isAdmin = req.isAdmin || false;
   
-  const errors = postValidator.validateCreate(req.body, isAdmin);
-  if (errors) {
+  // Run validation
+  await createPostValidation.run(req);
+  const errors = validationResult(req);
+  
+  if (!errors.isEmpty()) {
     if (isAdmin) {
-      console.warn('Admin post creation validation warnings (proceeding anyway):', errors);
+      console.warn('Admin post creation validation warnings (proceeding anyway):', errors.array());
       // Auto-fix ALL issues for admins
       req.body.title = req.body.title || 'Admin Post';
       req.body.content = req.body.content || req.body.description || 'Content created by admin';
@@ -271,7 +275,7 @@ exports.createPost = asyncHandler(async (req, res) => {
       req.body.status = req.body.status || 'published';
       req.body.category = req.body.category || 'update';
     } else {
-      return res.status(400).json({ success: false, errors });
+      return res.status(400).json({ success: false, errors: errors.array() });
     }
   }
 
@@ -332,10 +336,13 @@ exports.updatePost = asyncHandler(async (req, res) => {
     throw new ErrorResponse('Not authorized to update this post', 403);
   }
 
-  const errors = postValidator.validateUpdate(req.body, isAdmin);
-  if (errors) {
+  // Run validation
+  await updatePostValidation.run(req);
+  const errors = validationResult(req);
+  
+  if (!errors.isEmpty()) {
     if (isAdmin) {
-      console.warn('Admin post update validation warnings (proceeding anyway):', errors);
+      console.warn('Admin post update validation warnings (proceeding anyway):', errors.array());
       // Auto-fix any issues
       if (req.body.title === undefined || !req.body.title) req.body.title = post.title || 'Admin Post';
       if (req.body.content === undefined || !req.body.content) req.body.content = post.content || 'Content created by admin';
@@ -343,7 +350,7 @@ exports.updatePost = asyncHandler(async (req, res) => {
         req.body.category = 'update';
       }
     } else {
-      return res.status(400).json({ success: false, errors });
+      return res.status(400).json({ success: false, errors: errors.array() });
     }
   }
 
@@ -660,10 +667,14 @@ exports.getPostShares = asyncHandler(async (req, res) => {
  */
 exports.addComment = asyncHandler(async (req, res) => {
   const isAdmin = req.isAdmin || false;
-  const errors = postValidator.validateComment(req.body);
   
-  if (errors) {
-    return res.status(400).json({ success: false, errors });
+  // Basic comment validation
+  if (!req.body.content || req.body.content.trim().length === 0) {
+    return res.status(400).json({ success: false, errors: [{ msg: 'Comment content is required' }] });
+  }
+  
+  if (req.body.content.length > 1000) {
+    return res.status(400).json({ success: false, errors: [{ msg: 'Comment cannot exceed 1000 characters' }] });
   }
 
   let post = await Post.findById(req.params.id);
@@ -995,6 +1006,414 @@ exports.getPostsByCategory = asyncHandler(async (req, res) => {
     posts,
     data: { posts }
   });
+});
+
+// Additional missing exports
+exports.getPopularPosts = exports.getFeaturedPosts;
+exports.searchPosts = asyncHandler(async (req, res) => {
+  const { q, category, tags, page = 1, limit = 10 } = req.query;
+  
+  const query = { status: 'published' };
+  
+  if (q) {
+    query.$text = { $search: q };
+  }
+  
+  if (category) {
+    query.category = category;
+  }
+  
+  if (tags) {
+    query.tags = { $in: tags.split(',') };
+  }
+  
+  const skip = (page - 1) * limit;
+  
+  const posts = await Post.find(query)
+    .populate('author', 'firstName lastName avatar username')
+    .populate('category', 'name slug')
+    .populate('tags', 'name slug')
+    .limit(limit * 1)
+    .skip(skip)
+    .sort({ publishedAt: -1 })
+    .lean();
+  
+  const total = await Post.countDocuments(query);
+  
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    count: posts.length,
+    results: posts.length,
+    total,
+    pages: Math.ceil(total / limit),
+    pagination: {
+      page: parseInt(page),
+      limit: parseInt(limit),
+      total,
+      pages: Math.ceil(total / limit),
+    },
+    posts,
+    data: { posts }
+  });
+});
+
+exports.getRelatedPosts = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  
+  const post = await Post.findById(id);
+  if (!post) {
+    return res.status(404).json({
+      success: false,
+      status: 'error',
+      message: 'Post not found'
+    });
+  }
+  
+  const query = {
+    _id: { $ne: id },
+    status: 'published',
+    $or: [
+      { category: post.category },
+      { tags: { $in: post.tags } }
+    ]
+  };
+  
+  const posts = await Post.find(query)
+    .populate('author', 'firstName lastName avatar username')
+    .populate('category', 'name slug')
+    .populate('tags', 'name slug')
+    .limit(6)
+    .sort({ publishedAt: -1 })
+    .lean();
+  
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    count: posts.length,
+    posts,
+    data: { posts }
+  });
+});
+
+exports.getArchivedPosts = asyncHandler(async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const skip = (page - 1) * limit;
+
+  const query = {
+    author: req.user.id,
+    status: 'archived'
+  };
+
+  const posts = await Post.find(query)
+    .populate('author', 'firstName lastName avatar username')
+    .populate('category', 'name slug')
+    .populate('tags', 'name slug')
+    .limit(limit)
+    .skip(skip)
+    .sort({ updatedAt: -1 })
+    .lean();
+
+  const total = await Post.countDocuments(query);
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    count: posts.length,
+    results: posts.length,
+    total,
+    pages: Math.ceil(total / limit),
+    pagination: {
+      page,
+      limit,
+      total,
+      pages: Math.ceil(total / limit),
+    },
+    posts,
+    data: { posts }
+  });
+});
+
+exports.getDraftPosts = asyncHandler(async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const skip = (page - 1) * limit;
+
+  const query = {
+    author: req.user.id,
+    status: 'draft'
+  };
+
+  const posts = await Post.find(query)
+    .populate('author', 'firstName lastName avatar username')
+    .populate('category', 'name slug')
+    .populate('tags', 'name slug')
+    .limit(limit)
+    .skip(skip)
+    .sort({ updatedAt: -1 })
+    .lean();
+
+  const total = await Post.countDocuments(query);
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    count: posts.length,
+    results: posts.length,
+    total,
+    pages: Math.ceil(total / limit),
+    pagination: {
+      page,
+      limit,
+      total,
+      pages: Math.ceil(total / limit),
+    },
+    posts,
+    data: { posts }
+  });
+});
+
+exports.publishPost = asyncHandler(async (req, res) => {
+  const post = await Post.findByIdAndUpdate(
+    req.params.id,
+    { 
+      status: 'published',
+      publishedAt: new Date()
+    },
+    { new: true, runValidators: true }
+  ).populate('author', 'firstName lastName avatar username')
+   .populate('category', 'name slug')
+   .populate('tags', 'name slug');
+
+  if (!post) {
+    return res.status(404).json({
+      success: false,
+      status: 'error',
+      message: 'Post not found'
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    post,
+    data: { post }
+  });
+});
+
+exports.unpublishPost = asyncHandler(async (req, res) => {
+  const post = await Post.findByIdAndUpdate(
+    req.params.id,
+    { status: 'draft' },
+    { new: true, runValidators: true }
+  ).populate('author', 'firstName lastName avatar username')
+   .populate('category', 'name slug')
+   .populate('tags', 'name slug');
+
+  if (!post) {
+    return res.status(404).json({
+      success: false,
+      status: 'error',
+      message: 'Post not found'
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    post,
+    data: { post }
+  });
+});
+
+exports.archivePost = asyncHandler(async (req, res) => {
+  const post = await Post.findByIdAndUpdate(
+    req.params.id,
+    { status: 'archived' },
+    { new: true, runValidators: true }
+  ).populate('author', 'firstName lastName avatar username')
+   .populate('category', 'name slug')
+   .populate('tags', 'name slug');
+
+  if (!post) {
+    return res.status(404).json({
+      success: false,
+      status: 'error',
+      message: 'Post not found'
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    post,
+    data: { post }
+  });
+});
+
+exports.duplicatePost = asyncHandler(async (req, res) => {
+  const originalPost = await Post.findById(req.params.id);
+  
+  if (!originalPost) {
+    return res.status(404).json({
+      success: false,
+      status: 'error',
+      message: 'Post not found'
+    });
+  }
+
+  const duplicatedPost = new Post({
+    ...originalPost.toObject(),
+    _id: undefined,
+    title: `${originalPost.title} (Copy)`,
+    slug: `${originalPost.slug}-copy`,
+    status: 'draft',
+    publishedAt: null,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  });
+
+  await duplicatedPost.save();
+
+  const populatedPost = await Post.findById(duplicatedPost._id)
+    .populate('author', 'firstName lastName avatar username')
+    .populate('category', 'name slug')
+    .populate('tags', 'name slug');
+
+  res.status(201).json({
+    success: true,
+    status: 'success',
+    post: populatedPost,
+    data: { post: populatedPost }
+  });
+});
+
+exports.exportPost = asyncHandler(async (req, res) => {
+  const post = await Post.findById(req.params.id)
+    .populate('author', 'firstName lastName avatar username')
+    .populate('category', 'name slug')
+    .populate('tags', 'name slug');
+
+  if (!post) {
+    return res.status(404).json({
+      success: false,
+      status: 'error',
+      message: 'Post not found'
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    post,
+    data: { post }
+  });
+});
+
+exports.importPost = asyncHandler(async (req, res) => {
+  const { postData } = req.body;
+  
+  const post = new Post({
+    ...postData,
+    author: req.user.id,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  });
+
+  await post.save();
+
+  const populatedPost = await Post.findById(post._id)
+    .populate('author', 'firstName lastName avatar username')
+    .populate('category', 'name slug')
+    .populate('tags', 'name slug');
+
+  res.status(201).json({
+    success: true,
+    status: 'success',
+    post: populatedPost,
+    data: { post: populatedPost }
+  });
+});
+
+exports.bulkDeletePosts = asyncHandler(async (req, res) => {
+  const { postIds } = req.body;
+  
+  const result = await Post.deleteMany({ _id: { $in: postIds } });
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    deletedCount: result.deletedCount,
+    data: { deletedCount: result.deletedCount }
+  });
+});
+
+exports.bulkUpdatePosts = asyncHandler(async (req, res) => {
+  const { postIds, updateData } = req.body;
+  
+  const result = await Post.updateMany(
+    { _id: { $in: postIds } },
+    updateData,
+    { runValidators: true }
+  );
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    modifiedCount: result.modifiedCount,
+    data: { modifiedCount: result.modifiedCount }
+  });
+});
+
+exports.getEmbedCode = asyncHandler(async (req, res) => {
+  const post = await Post.findById(req.params.id);
+  
+  if (!post) {
+    return res.status(404).json({
+      success: false,
+      status: 'error',
+      message: 'Post not found'
+    });
+  }
+
+  const embedCode = `<iframe src="${process.env.FRONTEND_URL}/embed/post/${post._id}" width="100%" height="400" frameborder="0"></iframe>`;
+
+  res.status(200).json({
+    success: true,
+    status: 'success',
+    embedCode,
+    data: { embedCode }
+  });
+});
+
+exports.getOEmbed = asyncHandler(async (req, res) => {
+  const post = await Post.findById(req.params.id)
+    .populate('author', 'firstName lastName avatar username')
+    .populate('category', 'name slug');
+
+  if (!post) {
+    return res.status(404).json({
+      success: false,
+      status: 'error',
+      message: 'Post not found'
+    });
+  }
+
+  const oEmbed = {
+    type: 'rich',
+    version: '1.0',
+    title: post.title,
+    author_name: post.author.firstName + ' ' + post.author.lastName,
+    author_url: `${process.env.FRONTEND_URL}/author/${post.author.username}`,
+    provider_name: 'Gidi Blog',
+    provider_url: process.env.FRONTEND_URL,
+    html: `<blockquote>${post.excerpt}</blockquote>`,
+    width: 550,
+    height: 300
+  };
+
+  res.status(200).json(oEmbed);
 });
 
 module.exports = exports;

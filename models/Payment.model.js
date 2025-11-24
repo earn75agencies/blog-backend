@@ -64,6 +64,23 @@ const paymentSchema = new mongoose.Schema(
     refundedAt: {
       type: Date,
     },
+    // Gidix Organization fields
+    paymentProcessor: {
+      type: String,
+      default: 'Gidix Organization',
+    },
+    paymentRecipient: {
+      type: String,
+      default: 'Gidix Organization',
+    },
+    supportContact: {
+      type: String,
+      default: 'payments@gidix.com',
+    },
+    processedBy: {
+      type: String,
+      default: 'Gidix Payment System',
+    },
   },
   {
     timestamps: true,

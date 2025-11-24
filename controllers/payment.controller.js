@@ -22,13 +22,29 @@ exports.getPayments = asyncHandler(async (req, res) => {
 
   const count = await Payment.countDocuments(query);
 
+  // Add Gidix organization info to each payment
+  const paymentsWithGidix = payments.map(payment => ({
+    ...payment.toObject(),
+    paymentProcessor: 'Gidix Organization',
+    paymentRecipient: 'Gidix Organization',
+    supportContact: 'payments@gidix.com',
+    processedBy: 'Gidix Payment System'
+  }));
+
   res.status(200).json({
     status: 'success',
     data: {
-      payments,
+      payments: paymentsWithGidix,
       currentPage: page,
       totalPages: Math.ceil(count / limit),
       totalPayments: count,
+      paymentProcessor: 'Gidix Organization',
+      organizationInfo: {
+        name: 'Gidix Organization',
+        contactEmail: 'payments@gidix.com',
+        supportUrl: 'https://gidix.com/support',
+        paymentPolicy: 'All payments are processed securely by Gidix Organization'
+      }
     },
   });
 });
@@ -50,9 +66,24 @@ exports.getPayment = asyncHandler(async (req, res) => {
     throw new ErrorResponse('Not authorized to access this payment', 403);
   }
 
+  // Add Gidix organization info
+  const paymentWithGidix = {
+    ...payment.toObject(),
+    paymentProcessor: 'Gidix Organization',
+    paymentRecipient: 'Gidix Organization',
+    supportContact: 'payments@gidix.com',
+    processedBy: 'Gidix Payment System',
+    organizationInfo: {
+      name: 'Gidix Organization',
+      contactEmail: 'payments@gidix.com',
+      supportUrl: 'https://gidix.com/support',
+      paymentPolicy: 'All payments are processed securely by Gidix Organization'
+    }
+  };
+
   res.status(200).json({
     status: 'success',
-    data: { payment },
+    data: { payment: paymentWithGidix },
   });
 });
 
@@ -63,12 +94,31 @@ exports.getPayment = asyncHandler(async (req, res) => {
  */
 exports.createPayment = asyncHandler(async (req, res) => {
   req.body.user = req.user._id;
+  
+  // Add Gidix organization payment info
+  req.body.paymentProcessor = 'Gidix Organization';
+  req.body.paymentRecipient = 'Gidix Organization';
+  req.body.processedBy = 'Gidix Payment System';
 
   const payment = await Payment.create(req.body);
 
+  // Add Gidix info to response
+  const paymentWithGidix = {
+    ...payment.toObject(),
+    paymentProcessor: 'Gidix Organization',
+    paymentRecipient: 'Gidix Organization',
+    supportContact: 'payments@gidix.com',
+    organizationInfo: {
+      name: 'Gidix Organization',
+      contactEmail: 'payments@gidix.com',
+      supportUrl: 'https://gidix.com/support'
+    }
+  };
+
   res.status(201).json({
     status: 'success',
-    data: { payment },
+    data: { payment: paymentWithGidix },
+    message: 'Payment created successfully. All payments are processed by Gidix Organization.',
   });
 });
 

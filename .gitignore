@@ -1,13 +1,62 @@
-node_modules/
+# Environment Variables
 .env
+.env.local
+.env.development
+.env.production
+.env.deployment
+.env.*.local
+
+# Dependencies
+node_modules/
+
+# Logs
+logs
 *.log
-.DS_Store
+npm-debug.log*
+
+# Build outputs
 dist/
 build/
 coverage/
+
+# Runtime data
+pids
+*.pid
+*.seed
+
+# Uploads and user data
+uploads/
+media/
+
+# Sensitive files
+*.key
+*.pem
+*.crt
+ssl/
+certs/
+private/
+
+# Database
+*.sqlite
+*.sqlite3
+*.db
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Editor directories and files
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+.DS_Store
 
+# OS generated files
+Thumbs.db
+
+# Test files
+test-results/
+junit.xml
