@@ -10,6 +10,9 @@ const rateLimit = require('express-rate-limit');
 // Import admin initialization service
 const { initializeAdmins } = require('./services/admin-init.service');
 
+// Import Redis service to initialize it early
+const redisService = require('./services/redis/redis.service');
+
 // Load environment variables
 dotenv.config();
 

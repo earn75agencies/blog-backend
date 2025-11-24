@@ -1,31 +1,5 @@
-const Redis = require('redis');
 const NodeCache = require('node-cache');
-
-// Redis client for distributed caching
-const redisClient = Redis.createClient({
-  url: process.env.REDIS_URL || 'redis://localhost:6379',
-  password: process.env.REDIS_PASSWORD,
-  retry_strategy: (options) => {
-    if (options.error && options.error.code === 'ECONNREFUSED') {
-      return new Error('Redis server connection refused');
-    }
-    if (options.total_retry_time > 1000 * 60 * 60) {
-      return new Error('Retry time exhausted');
-    }
-    if (options.attempt > 10) {
-      return undefined;
-    }
-    return Math.min(options.attempt * 100, 3000);
-  },
-});
-
-redisClient.on('error', (err) => {
-  console.error('Redis Cache Error:', err);
-});
-
-redisClient.on('connect', () => {
-  console.log('✅ Redis Cache Connected');
-});
+const redisService = require('./redis/redis.service');
 
 // In-memory cache for fallback
 const memoryCache = new NodeCache({
@@ -42,11 +16,15 @@ class CacheService {
 
   async init() {
     try {
-      await redisClient.connect();
-      this.redisAvailable = true;
-      console.log('✅ Cache service initialized with Redis');
+      // Check if Redis is available
+      this.redisAvailable = await redisService.ensureConnection();
+      if (this.redisAvailable) {
+        console.log('✅ Cache service initialized with Redis');
+      } else {
+        console.log('⚠️ Redis unavailable, using memory cache only');
+      }
     } catch (error) {
-      console.warn('⚠️ Redis unavailable, using memory cache only:', error.message);
+      console.warn('⚠️ Redis initialization failed, using memory cache only:', error.message);
       this.redisAvailable = false;
     }
   }
@@ -55,8 +33,7 @@ class CacheService {
   async get(key) {
     try {
       if (this.redisAvailable) {
-        const value = await redisClient.get(key);
-        return value ? JSON.parse(value) : null;
+        return await redisService.get(key);
       } else {
         return memoryCache.get(key);
       }
@@ -69,15 +46,12 @@ class CacheService {
   // Set value in cache
   async set(key, value, ttl = 600) {
     try {
-      const serializedValue = JSON.stringify(value);
-      
       if (this.redisAvailable) {
-        await redisClient.setEx(key, ttl, serializedValue);
+        return await redisService.set(key, value, ttl);
       } else {
         memoryCache.set(key, value, ttl);
+        return true;
       }
-      
-      return true;
     } catch (error) {
       console.error('Cache set error:', error);
       return false;
@@ -88,11 +62,11 @@ class CacheService {
   async del(key) {
     try {
       if (this.redisAvailable) {
-        await redisClient.del(key);
+        return await redisService.del(key);
       } else {
         memoryCache.del(key);
+        return true;
       }
-      return true;
     } catch (error) {
       console.error('Cache delete error:', error);
       return false;
@@ -103,11 +77,12 @@ class CacheService {
   async clear() {
     try {
       if (this.redisAvailable) {
-        await redisClient.flushDb();
+        // Upstash Redis doesn't support flushDb, use pattern deletion
+        return await redisService.deletePattern('*');
       } else {
         memoryCache.flushAll();
+        return true;
       }
-      return true;
     } catch (error) {
       console.error('Cache clear error:', error);
       return false;
@@ -118,8 +93,7 @@ class CacheService {
   async mget(keys) {
     try {
       if (this.redisAvailable) {
-        const values = await redisClient.mGet(keys);
-        return values.map(value => value ? JSON.parse(value) : null);
+        return await redisService.mget(keys);
       } else {
         return keys.map(key => memoryCache.get(key));
       }
@@ -133,17 +107,13 @@ class CacheService {
   async mset(keyValuePairs, ttl = 600) {
     try {
       if (this.redisAvailable) {
-        const pipeline = redisClient.multi();
-        for (const [key, value] of keyValuePairs) {
-          pipeline.setEx(key, ttl, JSON.stringify(value));
-        }
-        await pipeline.exec();
+        return await redisService.mset(keyValuePairs, ttl);
       } else {
         for (const [key, value] of keyValuePairs) {
           memoryCache.set(key, value, ttl);
         }
+        return true;
       }
-      return true;
     } catch (error) {
       console.error('Cache mset error:', error);
       return false;
@@ -154,7 +124,11 @@ class CacheService {
   async incr(key, by = 1) {
     try {
       if (this.redisAvailable) {
-        return await redisClient.incrBy(key, by);
+        // Redis service doesn't have incr, implement using get/set
+        const current = await redisService.get(key) || 0;
+        const newValue = current + by;
+        await redisService.set(key, newValue);
+        return newValue;
       } else {
         const current = memoryCache.get(key) || 0;
         const newValue = current + by;
@@ -171,7 +145,7 @@ class CacheService {
   async exists(key) {
     try {
       if (this.redisAvailable) {
-        return await redisClient.exists(key);
+        return await redisService.exists(key);
       } else {
         return memoryCache.has(key);
       }
@@ -185,7 +159,13 @@ class CacheService {
   async expire(key, ttl) {
     try {
       if (this.redisAvailable) {
-        return await redisClient.expire(key, ttl);
+        // Redis service doesn't support expire directly
+        // Get the value and set it again with TTL
+        const value = await redisService.get(key);
+        if (value) {
+          return await redisService.set(key, value, ttl);
+        }
+        return false;
       } else {
         // NodeCache doesn't support setting expiration for existing keys
         const value = memoryCache.get(key);
@@ -205,8 +185,8 @@ class CacheService {
   async getStats() {
     try {
       if (this.redisAvailable) {
-        const info = await redisClient.info('memory');
-        return { type: 'redis', info };
+        const isHealthy = await redisService.ping();
+        return { type: 'redis', healthy: isHealthy };
       } else {
         const stats = memoryCache.getStats();
         return { type: 'memory', stats };
@@ -232,7 +212,7 @@ const cacheMiddleware = (keyPrefix, ttl = 600) => {
         return res.json(cachedData);
       }
       
-      // Override res.json to cache the response
+      // Override res.json to cache response
       const originalJson = res.json;
       res.json = function(data) {
         // Only cache successful responses
@@ -262,12 +242,9 @@ const invalidateCache = (keyPatterns) => {
         for (const pattern of keyPatterns) {
           try {
             if (cacheService.redisAvailable) {
-              const keys = await redisClient.keys(pattern);
-              if (keys.length > 0) {
-                await redisClient.del(keys);
-              }
+              await redisService.deletePattern(pattern);
             } else {
-              // For memory cache, we need to track keys differently
+              // For memory cache, flush all
               memoryCache.flushAll();
             }
           } catch (error) {
